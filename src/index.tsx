@@ -49,8 +49,9 @@ function htmlToMarkdown(html: string, baseUrl: string): string {
     let src = srcMatch[1];
     if (src.startsWith("//")) src = "https:" + src;
     if (!src.startsWith("http")) return "";
-    // Skip tiny icons and data URIs
+    // Skip tiny icons, WeChat emoji assets and data URIs
     if (src.includes("icon") && !src.includes("wx_fmt=png")) return "";
+    if (src.includes("wx_fed") || src.includes("/Expression/")) return "";
     const altMatch = tag.match(/alt\s*=\s*["']([^"']*)["']/i);
     const alt = altMatch ? altMatch[1] : "image";
     return `![${alt}](${src})`;
