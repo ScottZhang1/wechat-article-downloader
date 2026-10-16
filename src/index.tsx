@@ -24,6 +24,14 @@ function decodeEntities(s: string): string {
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n)));
 }
 
+function sanitizeFilename(name: string, maxLen = 80): string {
+  return name
+    .replace(/[\\/:*?"<>|\r\n\t]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen) || "untitled";
+}
+
 function stripTags(html: string): string {
   return decodeEntities(html.replace(/<[^>]*>/g, "")).trim();
 }
@@ -345,7 +353,215 @@ function buildHtmlPage(title: string, author: string, date: string, url: string,
 </html>`;
 }
 
-// ─── Frontend ───────────────────────────────────────────────────────
+// ─── WeRead (weread-omni SDK) integration ───────────────────────────
+
+const NODE_ENV2: Record<string, string> =
+  typeof process !== "undefined" ? (process.env as any) : {};
+const ADMIN_CODE2 = NODE_ENV2.ADMIN_CODE || "";
+
+type WereadModule = typeof import("weread-omni");
+let _weread: WereadModule | null = null;
+async function weread(): Promise<WereadModule> {
+  if (!_weread) _weread = (await import("weread-omni")) as any;
+  return _weread;
+}
+
+interface LoginState {
+  status: "idle" | "pending" | "done" | "error";
+  qrDataUrl?: string;
+  vid?: string;
+  error?: string;
+  promise?: Promise<any>;
+}
+const loginState: LoginState = { status: "idle" };
+
+function checkAdmin2(c: any): boolean {
+  const code = c.req.header("x-admin-code") || c.req.query("code");
+  return !!ADMIN_CODE2 && code === ADMIN_CODE2;
+}
+
+async function getCanonicalClient() {
+  const m = await weread();
+  const account = await new m.AccountManager().open("default");
+  return account.canonical;
+}
+
+app.post("/api/weread/login/start", async (c) => {
+  if (!checkAdmin2(c)) return c.json({ error: "unauthorized" }, 401);
+  if (loginState.status === "pending") {
+    return c.json({ already: true, qr: loginState.qrDataUrl });
+  }
+  try {
+    const m = await weread();
+    loginState.status = "pending";
+    loginState.error = undefined;
+    loginState.qrDataUrl = undefined;
+    const qrcode = await import("qrcode");
+    loginState.promise = m
+      .login({
+        onQr: async (confirmUrl: string) => {
+          loginState.qrDataUrl = await (qrcode as any).toDataURL(confirmUrl, { width: 260 });
+        },
+      })
+      .then(async (credentials: any) => {
+        m.saveCredentials(credentials, { store: "default" });
+        loginState.status = "done";
+        loginState.vid = String(credentials.vid);
+        return credentials;
+      })
+      .catch((err: any) => {
+        loginState.status = "error";
+        loginState.error = err?.message || String(err);
+        throw err;
+      });
+    // wait briefly for the QR to arrive
+    for (let i = 0; i < 20 && !loginState.qrDataUrl && loginState.status === "pending"; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (!loginState.qrDataUrl) {
+      const err = loginState.error || "二维码生成失败";
+      loginState.status = "idle";
+      return c.json({ error: err }, 500);
+    }
+    return c.json({ qr: loginState.qrDataUrl });
+  } catch (e: any) {
+    loginState.status = "idle";
+    return c.json({ error: e?.message || "login start failed" }, 500);
+  }
+});
+
+app.get("/api/weread/login/status", async (c) => {
+  if (!checkAdmin2(c)) return c.json({ error: "unauthorized" }, 401);
+  return c.json({
+    status: loginState.status,
+    vid: loginState.vid,
+    error: loginState.error,
+  });
+});
+
+app.get("/api/weread/status", async (c) => {
+  if (!checkAdmin2(c)) return c.json({ error: "unauthorized" }, 401);
+  try {
+    const m = await weread();
+    const credentials = m.loadCredentials({ store: "default" });
+    return c.json({ loggedIn: true, vid: String(credentials.vid) });
+  } catch {
+    return c.json({ loggedIn: false });
+  }
+});
+
+// ─── Batch export via weread-omni ───────────────────────────────────
+
+app.post("/api/batch/start", async (c) => {
+  const { url } = await c.req.json().catch(() => ({ url: "" }));
+  if (!url || !url.includes("mp.weixin.qq.com")) {
+    return c.json({ error: "请粘贴该公众号任意一篇文章的微信链接" }, 400);
+  }
+  try {
+    const weread = await getCanonicalClient();
+    // 1. resolve article → reviewId → accountId
+    const resolution = await weread.publicAccounts.resolveArticle(url);
+    const m = /^MP_WXS_(\d+)_/.exec(resolution.reviewId);
+    if (!m) return c.json({ error: "无法从链接解析公众号 ID：" + resolution.reviewId.slice(0, 40) }, 400);
+    const accountId = m[1];
+
+    // 2. ensure subscription (articles API may require it)
+    try {
+      await weread.publicAccounts.subscribe(accountId);
+    } catch { /* maybe already subscribed */ }
+
+    // 3. page through all articles
+    const articles: any[] = [];
+    let offset: number | undefined = undefined;
+    for (let i = 0; i < 60; i++) {
+      const page = await weread.publicAccounts.articles(accountId, {
+        count: 50,
+        ...(offset !== undefined ? { offset } : {}),
+      } as any);
+      articles.push(...(page.articles || []));
+      if (page.nextOffset === undefined || !(page.articles || []).length) break;
+      offset = page.nextOffset;
+      if (articles.length >= 2000) break;
+    }
+    if (!articles.length) return c.json({ error: "未获取到文章列表，请稍后重试" }, 404);
+
+    const firstName = articles.find((a) => a?.mpInfo?.mp_name)?.mpInfo?.mp_name || accountId;
+    const items = articles.map((a) => ({
+      title: a?.mpInfo?.title || a?.title || "未命名",
+      url: a?.mpInfo?.doc_url || "",
+      time: a?.createTime || a?.mpInfo?.time || 0,
+      name: a?.mpInfo?.mp_name || firstName,
+    }));
+    return c.json({ mpId: accountId, name: firstName, count: items.length, articles: items });
+  } catch (e: any) {
+    const msg = e?.message || "解析失败";
+    if (msg.includes("-2041") || msg.includes("验证")) {
+      return c.json({ error: "微信读书触发人机验证，请在微信读书 App 完成验证后重试" }, 429);
+    }
+    if (msg.includes("credentials") || msg.includes("login") || msg.includes("登录")) {
+      return c.json({ error: "微信读书账号未登录或已失效，请到管理页重新扫码" }, 401);
+    }
+    return c.json({ error: msg }, 500);
+  }
+});
+
+// ZIP of every article fetched from its original URL and converted to markdown
+app.get("/api/batch/zip", async (c) => {
+  const { articles, name } = await c.req.json().catch(() => ({ articles: [] as any[], name: "公众号" }));
+  if (!Array.isArray(articles) || !articles.length) return c.json({ error: "缺少文章列表" }, 400);
+  try {
+    const { JSZip } = await import("jszip");
+    const zip = new JSZip();
+    const queue = [...articles];
+    let done = 0;
+    async function worker() {
+      while (queue.length) {
+        const art = queue.shift()!;
+        try {
+          if (!art.url) continue;
+          const resp = await fetch(art.url, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+          });
+          if (resp.ok) {
+            const html = await resp.text();
+            const { title, author, content, date } = extractArticle(html);
+            const body = content ? htmlToMarkdown(content, art.url) : title || art.title;
+            const t = date || (art.time ? new Date(art.time * 1000).toISOString().slice(0, 10) : "");
+            zip.file(
+              `${String(done + 1).padStart(4, "0")}_${sanitizeFilename(title || art.title, 60)}.md`,
+              `# ${title || art.title}\n\n> 公众号：${author || art.name || name} | 日期：${t}\n> 原文：${art.url}\n\n---\n\n${body}\n`
+            );
+          }
+        } catch { /* skip failures */ }
+        done++;
+      }
+    }
+    await Promise.all(Array.from({ length: 4 }, worker));
+
+    const manifest = {
+      account: name,
+      total: articles.length,
+      exportedAt: new Date().toISOString(),
+      articles: articles.map((a: any, i: number) => ({
+        index: i + 1, title: a.title, url: a.url,
+        publishTime: a.time ? new Date(a.time * 1000).toISOString() : null,
+      })),
+    };
+    zip.file("manifest.json", JSON.stringify(manifest, null, 2));
+    const buf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+    return new Response(buf as any, {
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(`${sanitizeFilename(name, 50)}_文章导出.zip`)}`,
+      },
+    });
+  } catch (e: any) {
+    return c.json({ error: e?.message || "打包失败" }, 500);
+  }
+});
+
 
 app.get("/", (c) => {
   return c.html(FRONTEND_HTML);
@@ -353,210 +569,192 @@ app.get("/", (c) => {
 
 app.get("/healthz", (c) => c.text("ok"));
 
-// 404
+app.get("/admin", (c) => c.html(ADMIN_HTML));
+
 app.notFound((c) => c.text("Not Found", 404));
 
 export default app;
-
-// ─── Frontend HTML ──────────────────────────────────────────────────
 
 const FRONTEND_HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>公众号文章下载 - 免费在线工具</title>
-<meta name="description" content="免费在线微信公众号文章下载工具，支持导出 Markdown、HTML、纯文本格式">
+<title>公众号文章下载 - 免费 · 单篇/批量导出</title>
+<meta name="description" content="免费在线微信公众号文章下载工具，支持单篇导出 Markdown/HTML/纯文本，支持批量导出公众号全部历史文章 ZIP">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: #f7f8fa; color: #333; min-height: 100vh;
-  }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f7f8fa; color: #333; min-height: 100vh; }
   .container { max-width: 680px; margin: 0 auto; padding: 24px 16px; }
-
-  .header { text-align: center; padding: 48px 0 32px; }
+  .header { text-align: center; padding: 40px 0 24px; }
   .header h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
   .header p { color: #888; font-size: 15px; }
-
-  .card {
-    background: #fff; border-radius: 16px; padding: 28px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06); margin-bottom: 24px;
-  }
-
+  .tabs { display: flex; gap: 8px; margin-bottom: 20px; background: #fff; padding: 6px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .tab { flex: 1; text-align: center; padding: 12px; font-size: 15px; font-weight: 600; border-radius: 8px; cursor: pointer; color: #666; transition: all .2s; }
+  .tab.active { background: #07c160; color: #fff; }
+  .panel { display: none; }
+  .panel.show { display: block; }
+  .card { background: #fff; border-radius: 16px; padding: 28px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); margin-bottom: 24px; }
   .input-group { display: flex; gap: 12px; margin-bottom: 16px; }
-  .input-group input {
-    flex: 1; padding: 14px 16px; font-size: 15px;
-    border: 2px solid #e5e7eb; border-radius: 12px; outline: none;
-    transition: border-color 0.2s;
-  }
+  .input-group input { flex: 1; padding: 14px 16px; font-size: 15px; border: 2px solid #e5e7eb; border-radius: 12px; outline: none; transition: border-color .2s; }
   .input-group input:focus { border-color: #07c160; }
-  .input-group input::placeholder { color: #c0c4cc; }
-
-  .btn {
-    padding: 14px 28px; font-size: 15px; font-weight: 600;
-    border: none; border-radius: 12px; cursor: pointer;
-    transition: all 0.2s; white-space: nowrap;
-  }
+  input::placeholder { color: #c0c4cc; }
+  .btn { padding: 14px 28px; font-size: 15px; font-weight: 600; border: none; border-radius: 12px; cursor: pointer; transition: all .2s; white-space: nowrap; }
   .btn-primary { background: #07c160; color: #fff; }
   .btn-primary:hover { background: #06ad56; }
   .btn-primary:disabled { background: #c0c4cc; cursor: not-allowed; }
-
   .formats { display: flex; gap: 8px; flex-wrap: wrap; }
-  .format-btn {
-    padding: 8px 16px; font-size: 13px; border: 1px solid #dcdfe6;
-    border-radius: 8px; cursor: pointer; background: #fff; transition: all 0.2s;
-  }
+  .format-btn { padding: 8px 16px; font-size: 13px; border: 1px solid #dcdfe6; border-radius: 8px; cursor: pointer; background: #fff; transition: all .2s; }
   .format-btn.active { background: #07c160; color: #fff; border-color: #07c160; }
   .format-btn:hover:not(.active) { border-color: #07c160; color: #07c160; }
-
   .result { margin-top: 24px; display: none; }
   .result.show { display: block; }
-
-  .result-header {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 16px 0; border-bottom: 1px solid #f0f0f0; margin-bottom: 16px;
-  }
+  .result-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 0; border-bottom: 1px solid #f0f0f0; margin-bottom: 16px; }
   .result-title { font-size: 18px; font-weight: 600; }
   .result-meta { color: #999; font-size: 13px; margin-top: 4px; }
-
-  .preview {
-    background: #fafafa; border-radius: 12px; padding: 20px;
-    max-height: 400px; overflow-y: auto; font-size: 14px; line-height: 1.8;
-    white-space: pre-wrap; word-break: break-word; color: #444;
-    border: 1px solid #f0f0f0;
-  }
-
+  .preview { background: #fafafa; border-radius: 12px; padding: 20px; max-height: 400px; overflow-y: auto; font-size: 14px; line-height: 1.8; white-space: pre-wrap; word-break: break-word; color: #444; border: 1px solid #f0f0f0; }
   .download-row { display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
-  .dl-btn {
-    flex: 1; min-width: 120px; padding: 12px; font-size: 14px; font-weight: 600;
-    border: 2px solid #07c160; border-radius: 10px; cursor: pointer;
-    background: #fff; color: #07c160; transition: all 0.2s; text-align: center;
-    text-decoration: none; display: inline-block;
-  }
+  .dl-btn { flex: 1; min-width: 120px; padding: 12px; font-size: 14px; font-weight: 600; border: 2px solid #07c160; border-radius: 10px; cursor: pointer; background: #fff; color: #07c160; transition: all .2s; text-align: center; text-decoration: none; display: inline-block; }
   .dl-btn:hover { background: #07c160; color: #fff; }
-
-  .error {
-    background: #fef0f0; color: #f56c6c; padding: 12px 16px;
-    border-radius: 8px; margin-top: 16px; font-size: 14px; display: none;
-  }
+  .error { background: #fef0f0; color: #f56c6c; padding: 12px 16px; border-radius: 8px; margin-top: 16px; font-size: 14px; display: none; }
   .error.show { display: block; }
-
-  .loading {
-    text-align: center; padding: 32px; color: #999; display: none;
-  }
+  .loading { text-align: center; padding: 32px; color: #999; display: none; }
   .loading.show { display: block; }
-  .spinner {
-    display: inline-block; width: 24px; height: 24px;
-    border: 3px solid #e5e7eb; border-top-color: #07c160;
-    border-radius: 50%; animation: spin 0.8s linear infinite;
-  }
+  .spinner { display: inline-block; width: 24px; height: 24px; border: 3px solid #e5e7eb; border-top-color: #07c160; border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-
-  .features {
-    display: grid; grid-template-columns: repeat(3, 1fr);
-    gap: 12px; margin-top: 32px;
-  }
-  @media (max-width: 480px) {
-    .features { grid-template-columns: 1fr; }
-    .input-group { flex-direction: column; }
-  }
-  .feature {
-    text-align: center; padding: 20px 12px;
-    background: #fff; border-radius: 12px;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-  }
+  .tips { margin-top: 16px; padding: 16px; background: #f0f9eb; border-radius: 8px; font-size: 13px; color: #67c23a; line-height: 1.8; }
+  .features { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin-top: 32px; }
+  @media (max-width: 480px) { .features { grid-template-columns: 1fr; } .input-group { flex-direction: column; } }
+  .feature { text-align: center; padding: 20px 12px; background: #fff; border-radius: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
   .feature-icon { font-size: 28px; margin-bottom: 8px; }
   .feature h3 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
   .feature p { font-size: 12px; color: #999; }
-
-  .footer {
-    text-align: center; padding: 40px 0 24px;
-    color: #c0c4cc; font-size: 12px;
-  }
+  .footer { text-align: center; padding: 40px 0 24px; color: #c0c4cc; font-size: 12px; }
   .footer a { color: #999; text-decoration: none; }
-
-  .tips { margin-top: 16px; padding: 16px; background: #f0f9eb; border-radius: 8px; font-size: 13px; color: #67c23a; line-height: 1.8; }
+  /* batch panel */
+  .batch-step { display: none; }
+  .batch-step.show { display: block; }
+  .batch-status { background: #fafafa; border: 1px solid #f0f0f0; border-radius: 12px; padding: 20px; text-align: center; }
+  .batch-count { font-size: 40px; font-weight: 700; color: #07c160; margin: 8px 0; }
+  .batch-label { color: #888; font-size: 14px; }
+  .progress-bar { height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden; margin: 16px auto; max-width: 300px; }
+  .progress-bar .fill { height: 100%; background: #07c160; border-radius: 4px; width: 30%; animation: pulse 1.5s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: .5 } 50% { opacity: 1 } }
+  .art-list { max-height: 300px; overflow-y: auto; text-align: left; margin-top: 16px; }
+  .art-item { padding: 10px 12px; border-bottom: 1px solid #f5f5f5; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
+  .art-item a { color: #333; text-decoration: none; }
+  .art-item a:hover { color: #07c160; }
+  .art-item .date { color: #bbb; font-size: 12px; white-space: nowrap; }
+  .big-btn { display: block; width: 100%; padding: 16px; font-size: 16px; background: #07c160; color: #fff; border: none; border-radius: 12px; font-weight: 700; cursor: pointer; margin-top: 16px; }
+  .big-btn:disabled { background: #c0c4cc; }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
     <h1>📄 公众号文章下载</h1>
-    <p>粘贴微信公众号文章链接，一键导出为 Markdown、HTML 或纯文本</p>
+    <p>单篇秒下 · 整号批量打包，导出 Markdown / HTML / 纯文本</p>
   </div>
 
-  <div class="card">
-    <div class="input-group">
-      <input type="url" id="url-input" placeholder="https://mp.weixin.qq.com/s/..." />
-      <button class="btn btn-primary" id="btn-fetch" onclick="fetchArticle()">下载</button>
-    </div>
+  <div class="tabs">
+    <div class="tab active" data-tab="single" onclick="switchTab('single')">单篇下载</div>
+    <div class="tab" data-tab="batch" onclick="switchTab('batch')">批量导出整号</div>
+  </div>
 
-    <div class="formats">
-      <button class="format-btn active" data-format="markdown">Markdown</button>
-      <button class="format-btn" data-format="html">HTML</button>
-      <button class="format-btn" data-format="text">纯文本</button>
-      <button class="format-btn" data-format="json">JSON</button>
-    </div>
-
-    <div class="error" id="error-box"></div>
-    <div class="loading" id="loading-box">
-      <div class="spinner"></div>
-      <p style="margin-top: 12px;">正在获取文章内容...</p>
-    </div>
-
-    <div class="result" id="result-box">
-      <div class="result-header">
-        <div>
-          <div class="result-title" id="result-title"></div>
-          <div class="result-meta" id="result-meta"></div>
+  <!-- ============ 单篇下载 ============ -->
+  <div class="panel show" id="panel-single">
+    <div class="card">
+      <div class="input-group">
+        <input type="url" id="url-input" placeholder="https://mp.weixin.qq.com/s/..." />
+        <button class="btn btn-primary" id="btn-fetch" onclick="fetchArticle()">下载</button>
+      </div>
+      <div class="formats">
+        <button class="format-btn active" data-format="markdown">Markdown</button>
+        <button class="format-btn" data-format="html">HTML</button>
+        <button class="format-btn" data-format="text">纯文本</button>
+        <button class="format-btn" data-format="json">JSON</button>
+      </div>
+      <div class="error" id="error-box"></div>
+      <div class="loading" id="loading-box"><div class="spinner"></div><p style="margin-top:12px">正在获取文章内容...</p></div>
+      <div class="result" id="result-box">
+        <div class="result-header">
+          <div>
+            <div class="result-title" id="result-title"></div>
+            <div class="result-meta" id="result-meta"></div>
+          </div>
+        </div>
+        <div class="preview" id="preview"></div>
+        <div class="download-row">
+          <a class="dl-btn" id="dl-markdown" href="#">📥 Markdown</a>
+          <a class="dl-btn" id="dl-html" href="#" target="_blank">🌐 HTML</a>
+          <a class="dl-btn" id="dl-text" href="#">📝 纯文本</a>
         </div>
       </div>
-      <div class="preview" id="preview"></div>
-      <div class="download-row">
-        <a class="dl-btn" id="dl-markdown" href="#" download>📥 Markdown</a>
-        <a class="dl-btn" id="dl-html" href="#" target="_blank">🌐 HTML</a>
-        <a class="dl-btn" id="dl-text" href="#">📝 纯文本</a>
+    </div>
+    <div class="features">
+      <div class="feature"><div class="feature-icon">⚡</div><h3>一键导出</h3><p>粘贴链接即可获取</p></div>
+      <div class="feature"><div class="feature-icon">📝</div><h3>Markdown 格式</h3><p>保留图片和排版</p></div>
+      <div class="feature"><div class="feature-icon">🔒</div><h3>无需登录</h3><p>免费使用，不存数据</p></div>
+    </div>
+  </div>
+
+  <!-- ============ 批量导出 ============ -->
+  <div class="panel" id="panel-batch">
+    <div class="card">
+      <!-- Step 1: input -->
+      <div class="batch-step show" id="bs-input">
+        <div class="input-group">
+          <input type="url" id="batch-url" placeholder="粘贴该公众号任意一篇文章链接" />
+        </div>
+        <button class="big-btn" id="btn-batch" onclick="batchStart()">🔍 解析并同步全部文章</button>
+        <div class="error" id="batch-error"></div>
+        <div class="tips" style="margin-top:16px">
+          💡 <strong>怎么导出一个公众号的全部文章？</strong><br>
+          1. 在微信里打开该公众号的<b>任意一篇</b>文章 → 右上角「...」→ 复制链接<br>
+          2. 粘贴到上面输入框 → 点击解析<br>
+          3. 等待同步完成 → 点击「打包下载 ZIP」<br>
+          ⏱️ 文章越多同步越慢（约每分钟 100 篇），请耐心等待
+        </div>
+      </div>
+      <!-- Step 2: syncing progress -->
+      <div class="batch-step" id="bs-progress">
+        <div class="batch-status">
+          <div class="batch-label" id="batch-name">正在解析公众号...</div>
+          <div class="batch-count"><span id="batch-count">0</span> 篇</div>
+          <div class="progress-bar"><div class="fill"></div></div>
+          <div class="batch-label" id="batch-status-text">正在同步历史文章，文章较多时需要几分钟...</div>
+        </div>
+      </div>
+      <!-- Step 3: done -->
+      <div class="batch-step" id="bs-done">
+        <div class="batch-status">
+          <div class="batch-label" id="done-name"></div>
+          <div class="batch-count"><span id="done-count">0</span> 篇</div>
+          <div class="batch-label">文章同步完成 ✅</div>
+        </div>
+        <button class="big-btn" id="btn-zip" onclick="downloadZip()">📦 打包下载全部文章 (ZIP)</button>
+        <div class="art-list" id="art-list"></div>
+        <button class="big-btn" style="background:#fff;color:#07c160;border:2px solid #07c160" onclick="batchReset()">再导出一个公众号</button>
       </div>
     </div>
-  </div>
-
-  <div class="features">
-    <div class="feature">
-      <div class="feature-icon">⚡</div>
-      <h3>一键导出</h3>
-      <p>粘贴链接即可获取</p>
-    </div>
-    <div class="feature">
-      <div class="feature-icon">📝</div>
-      <h3>Markdown 格式</h3>
-      <p>保留图片和排版</p>
-    </div>
-    <div class="feature">
-      <div class="feature-icon">🔒</div>
-      <h3>无需登录</h3>
-      <p>免费使用，不存数据</p>
-    </div>
-  </div>
-
-  <div class="tips">
-    💡 <strong>使用提示</strong><br>
-    1. 打开微信文章，点击右上角「...」→「复制链接」<br>
-    2. 粘贴到上方输入框，点击「下载」<br>
-    3. 选择需要的格式，点击下载按钮保存到本地
   </div>
 
   <div class="footer">
-    <a href="https://yinuo-ai.com" target="_blank">一诺 AI</a> · 免费· 不存储任何数据
+    <a href="https://yinuo-ai.com" target="_blank">一诺 AI</a> · 免费 · 不存储任何数据 · <a href="/admin">管理</a>
   </div>
 </div>
 
 <script>
+// ============ tabs ============
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('show'));
+  document.getElementById('panel-' + name).classList.add('show');
+}
+
+// ============ single download ============
 let currentUrl = '';
 let currentFormat = 'markdown';
-let currentData = null;
-
-// Format selector
 document.querySelectorAll('.format-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.format-btn').forEach(b => b.classList.remove('active'));
@@ -564,77 +762,256 @@ document.querySelectorAll('.format-btn').forEach(btn => {
     currentFormat = btn.dataset.format;
   });
 });
-
-// Enter key
-document.getElementById('url-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') fetchArticle();
-});
+document.getElementById('url-input').addEventListener('keydown', e => { if (e.key === 'Enter') fetchArticle(); });
 
 async function fetchArticle() {
-  const input = document.getElementById('url-input');
-  const url = input.value.trim();
+  const url = document.getElementById('url-input').value.trim();
   const btn = document.getElementById('btn-fetch');
-  const errBox = document.getElementById('error-box');
-  const loadingBox = document.getElementById('loading-box');
-  const resultBox = document.getElementById('result-box');
-
-  // Reset
-  errBox.classList.remove('show');
-  resultBox.classList.remove('show');
-
-  if (!url || !url.includes('mp.weixin.qq.com')) {
-    showError('请输入有效的微信公众号文章链接（以 mp.weixin.qq.com 开头）');
-    return;
-  }
-
+  document.getElementById('error-box').classList.remove('show');
+  document.getElementById('result-box').classList.remove('show');
+  if (!url || !url.includes('mp.weixin.qq.com')) { showSingleError('请输入有效的微信公众号文章链接'); return; }
   currentUrl = url;
-  btn.disabled = true;
-  btn.textContent = '获取中...';
-  loadingBox.classList.add('show');
-
+  btn.disabled = true; btn.textContent = '获取中...';
+  document.getElementById('loading-box').classList.add('show');
   try {
     const resp = await fetch('/api/preview?url=' + encodeURIComponent(url));
     const data = await resp.json();
-
-    if (!resp.ok) {
-      throw new Error(data.error || '获取失败');
-    }
-
-    currentData = data;
+    if (!resp.ok) throw new Error(data.error || '获取失败');
     showResult(data);
-  } catch (e) {
-    showError(e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '下载';
-    loadingBox.classList.remove('show');
-  }
+  } catch (e) { showSingleError(e.message); }
+  finally { btn.disabled = false; btn.textContent = '下载'; document.getElementById('loading-box').classList.remove('show'); }
 }
-
 function showResult(data) {
   document.getElementById('result-title').textContent = data.title || '未命名文章';
-  document.getElementById('result-meta').textContent =
-    (data.author ? '公众号：' + data.author : '') +
-    (data.date ? ' | ' + data.date : '') +
-    ' | ' + (data.length || 0) + ' 字符';
-
+  document.getElementById('result-meta').textContent = (data.author ? '公众号：' + data.author : '') + (data.date ? ' | ' + data.date : '') + ' | ' + (data.length || 0) + ' 字符';
   document.getElementById('preview').textContent = data.markdown || '';
-
-  // Download links
-  const encoded = encodeURIComponent(currentUrl);
-  document.getElementById('dl-markdown').href = '/api/download?url=' + encoded + '&format=markdown';
-  document.getElementById('dl-html').href = '/api/download?url=' + encoded + '&format=html';
-  document.getElementById('dl-text').href = '/api/download?url=' + encoded + '&format=text';
-
+  const enc = encodeURIComponent(currentUrl);
+  document.getElementById('dl-markdown').href = '/api/download?url=' + enc + '&format=markdown';
+  document.getElementById('dl-html').href = '/api/download?url=' + enc + '&format=html';
+  document.getElementById('dl-text').href = '/api/download?url=' + enc + '&format=text';
   document.getElementById('result-box').classList.add('show');
-  document.getElementById('result-box').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function showSingleError(msg) { const box = document.getElementById('error-box'); box.textContent = '⚠ ' + msg; box.classList.add('show'); }
+
+// ============ batch export ============
+let batchMpId = null;
+let pollTimer = null;
+
+async function batchStart() {
+  const url = document.getElementById('batch-url').value.trim();
+  const btn = document.getElementById('btn-batch');
+  const errBox = document.getElementById('batch-error');
+  errBox.classList.remove('show');
+  if (!url || !url.includes('mp.weixin.qq.com')) { showBatchError('请粘贴该公众号任意一篇文章的微信链接'); return; }
+  btn.disabled = true; btn.textContent = '解析中...';
+  try {
+    const resp = await fetch('/api/batch/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || '解析失败');
+    batchMpId = data.mpId;
+    document.getElementById('batch-name').textContent = '公众号：' + (data.name || data.mpId);
+    document.getElementById('bs-input').classList.remove('show');
+    document.getElementById('bs-progress').classList.add('show');
+    pollTimer = setInterval(pollProgress, 5000);
+    pollProgress();
+  } catch (e) { showBatchError(e.message); }
+  finally { btn.disabled = false; btn.textContent = '🔍 解析并同步全部文章'; }
 }
 
-function showError(msg) {
-  const box = document.getElementById('error-box');
-  box.textContent = '⚠ ' + msg;
-  box.classList.add('show');
+async function pollProgress() {
+  if (!batchMpId) return;
+  try {
+    const resp = await fetch('/api/batch/progress?mpId=' + batchMpId);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error);
+    document.getElementById('batch-count').textContent = data.count || 0;
+    if (!data.running) {
+      clearInterval(pollTimer);
+      await showDone();
+    }
+  } catch (e) { console.error(e); }
+}
+
+async function showDone() {
+  const resp = await fetch('/api/batch/articles?mpId=' + batchMpId);
+  const data = await resp.json();
+  document.getElementById('done-name').textContent = '公众号：' + (data.name || '');
+  document.getElementById('done-count').textContent = data.count || 0;
+  document.getElementById('art-list').innerHTML = (data.articles || []).slice(0, 50).map(a => {
+    const d = a.publishTime ? new Date(a.publishTime * 1000).toISOString().slice(0, 10) : '';
+    return '<div class="art-item"><a href="' + a.url + '" target="_blank">' + a.title + '</a><span class="date">' + d + '</span></div>';
+  }).join('') + (data.count > 50 ? '<div class="art-item" style="justify-content:center;color:#999">... 共 ' + data.count + ' 篇</div>' : '');
+  document.getElementById('bs-progress').classList.remove('show');
+  document.getElementById('bs-done').classList.add('show');
+}
+
+function downloadZip() {
+  if (!batchMpId) return;
+  const btn = document.getElementById('btn-zip');
+  btn.disabled = true; btn.textContent = '⏳ 正在抓取全文并打包（文章多时需几分钟，请勿关闭页面）...';
+  const a = document.createElement('a');
+  a.href = '/api/batch/zip?mpId=' + batchMpId;
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // allow repeat download
+  setTimeout(() => { btn.disabled = false; btn.textContent = '📦 打包下载全部文章 (ZIP)'; }, 8000);
+}
+
+function batchReset() {
+  batchMpId = null;
+  if (pollTimer) clearInterval(pollTimer);
+  document.getElementById('batch-url').value = '';
+  document.getElementById('bs-done').classList.remove('show');
+  document.getElementById('bs-input').classList.add('show');
+}
+function showBatchError(msg) { const box = document.getElementById('batch-error'); box.textContent = '⚠ ' + msg; box.classList.add('show'); }
+</script>
+</body>
+</html>`;
+
+
+// ─── Admin page HTML ────────────────────────────────────────────────
+
+const ADMIN_HTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理后台 - 微信读书账号</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f7f8fa; min-height: 100vh; padding: 32px 16px; }
+  .container { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 24px; text-align: center; }
+  .card { background: #fff; border-radius: 16px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); margin-bottom: 16px; }
+  input { width: 100%; padding: 12px 14px; font-size: 15px; border: 2px solid #e5e7eb; border-radius: 10px; outline: none; }
+  input:focus { border-color: #07c160; }
+  button { padding: 12px 20px; font-size: 14px; font-weight: 600; border: none; border-radius: 10px; cursor: pointer; background: #07c160; color: #fff; }
+  button:disabled { background: #c0c4cc; }
+  button.gray { background: #909399; }
+  .qr-box { text-align: center; padding: 20px; }
+  .qr-box img { width: 240px; height: 240px; border-radius: 8px; }
+  .hint { color: #888; font-size: 13px; margin-top: 12px; line-height: 1.8; text-align: center; }
+  .acct { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #f0f0f0; }
+  .acct-name { font-weight: 600; }
+  .acct-id { color: #999; font-size: 12px; }
+  .del { background: #f56c6c; padding: 6px 12px; font-size: 12px; border-radius: 6px; }
+  .ok { color: #07c160; font-size: 13px; }
+  .warn { color: #e6a23c; font-size: 13px; }
+  .err { color: #f56c6c; font-size: 13px; margin-top: 8px; display: none; }
+  .err.show { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔐 管理后台</h1>
+  <div class="card" id="login-card">
+    <input type="password" id="code" placeholder="输入管理密码" />
+    <div style="margin-top:12px"><button onclick="saveCode()">进入</button></div>
+    <div class="err" id="err1"></div>
+  </div>
+  <div id="main" style="display:none">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <b>微信读书账号</b>
+        <button onclick="startLogin()" id="addBtn">+ 扫码添加账号</button>
+      </div>
+      <div id="acct-list">加载中...</div>
+      <p class="hint" style="text-align:left">• 扫码登录微信读书后，账号用于抓取公众号数据<br>• 状态「今日小黑屋」表示请求过频，次日恢复<br>• 建议添加 2-3 个账号轮换</p>
+    </div>
+    <div class="card qr-box" id="qr-card" style="display:none">
+      <img id="qr-img" alt="二维码" />
+      <p class="hint">请用<b>微信</b>扫描二维码，打开微信读书授权登录<br>扫码后此页面会自动完成添加</p>
+      <p class="warn" id="login-status" style="margin-top:8px">等待扫码...</p>
+      <button class="gray" style="margin-top:8px" onclick="cancelLogin()">取消</button>
+    </div>
+  </div>
+</div>
+<script>
+let ADMIN = localStorage.getItem('admin_code') || '';
+let loginUuid = null;
+let pollTimer = null;
+
+if (ADMIN) { tryEnter(); }
+
+function saveCode() {
+  ADMIN = document.getElementById('code').value.trim();
+  tryEnter();
+}
+function showErr(id, msg) { const el = document.getElementById(id); el.textContent = msg; el.classList.add('show'); }
+
+async function api(path, opts = {}) {
+  const resp = await fetch(path, { ...opts, headers: { 'x-admin-code': ADMIN, ...(opts.headers||{}) } });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || resp.status);
+  return data;
+}
+
+async function tryEnter() {
+  try {
+    await api('/api/werss/accounts');
+    localStorage.setItem('admin_code', ADMIN);
+    document.getElementById('login-card').style.display = 'none';
+    document.getElementById('main').style.display = 'block';
+    loadAccounts();
+  } catch (e) { showErr('err1', '密码错误：' + e.message); }
+}
+
+async function loadAccounts() {
+  try {
+    const data = await api('/api/werss/accounts');
+    const el = document.getElementById('acct-list');
+    if (!data.items.length) { el.innerHTML = '<p class="warn">暂无账号，点击上方按钮扫码添加</p>'; return; }
+    el.innerHTML = data.items.map(a => {
+      const st = a.status === 1 ? '<span class="ok">正常</span>' : '<span class="warn">状态 ' + a.status + '</span>';
+      return '<div class="acct"><div><div class="acct-name">' + (a.name||'未命名') + '</div><div class="acct-id">' + a.id + '</div></div><div style="display:flex;gap:8px;align-items:center">' + st + '<button class="del" onclick="delAcct(\\'' + a.id + '\\')">删除</button></div></div>';
+    }).join('');
+  } catch (e) { document.getElementById('acct-list').textContent = '加载失败: ' + e.message; }
+}
+
+async function delAcct(id) {
+  if (!confirm('确定删除该账号？')) return;
+  await api('/api/werss/account/' + id, { method: 'DELETE' });
+  loadAccounts();
+}
+
+async function startLogin() {
+  const btn = document.getElementById('addBtn');
+  btn.disabled = true;
+  try {
+    const data = await api('/api/werss/login/start', { method: 'POST' });
+    loginUuid = data.uuid;
+    document.getElementById('qr-img').src = data.qr;
+    document.getElementById('qr-card').style.display = 'block';
+    document.getElementById('login-status').textContent = '等待扫码...';
+    pollTimer = setInterval(checkLogin, 3000);
+  } catch (e) { alert('启动登录失败: ' + e.message); }
+  btn.disabled = false;
+}
+
+async function checkLogin() {
+  if (!loginUuid) return;
+  try {
+    const data = await api('/api/werss/login/check?id=' + loginUuid);
+    if (data.ok) {
+      clearInterval(pollTimer);
+      document.getElementById('login-status').innerHTML = '<span class="ok">✓ 登录成功：' + data.name + '</span>';
+      setTimeout(() => { document.getElementById('qr-card').style.display = 'none'; loadAccounts(); }, 1500);
+    } else if (data.message) {
+      clearInterval(pollTimer);
+      document.getElementById('login-status').innerHTML = '<span class="err show">登录失败: ' + data.message + '</span>';
+    }
+  } catch (e) { /* keep polling */ }
+}
+
+function cancelLogin() {
+  loginUuid = null;
+  if (pollTimer) clearInterval(pollTimer);
+  document.getElementById('qr-card').style.display = 'none';
 }
 </script>
 </body>
 </html>`;
+
