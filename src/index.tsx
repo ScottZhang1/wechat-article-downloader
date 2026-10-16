@@ -380,10 +380,45 @@ function checkAdmin2(c: any): boolean {
   return !!ADMIN_CODE2 && code === ADMIN_CODE2;
 }
 
+import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+/** AccountManager 需要 descriptor + client state 文件，登录后手动补齐（旧版迁移兼容）。 */
+function ensureWereadAccountFiles(creds: any): void {
+  const root = NODE_ENV2.WEREAD_CONFIG_DIR || join(homedir(), ".config", "weread");
+  const dir = join(root, "accounts", "default");
+  mkdirSync(join(dir, "clients"), { recursive: true, mode: 0o700 });
+  const state = {
+    version: 1,
+    eink: {
+      vid: String(creds.vid),
+      refreshToken: creds.refreshToken,
+      deviceId: creds.deviceId,
+      ...(creds.accessToken ? { accessToken: creds.accessToken } : {}),
+    },
+  };
+  writeFileSync(join(dir, "account.json"), JSON.stringify({ version: 1, client: "eink" }), { mode: 0o600 });
+  writeFileSync(join(dir, "clients", "eink.json"), JSON.stringify(state), { mode: 0o600 });
+  writeFileSync(join(root, "config.json"), JSON.stringify({ version: 1, defaultAccount: "default" }), { mode: 0o600 });
+}
+
 async function getCanonicalClient() {
   const m = await weread();
-  const account = await new m.AccountManager().open("default");
-  return account.canonical;
+  try {
+    const account = await new m.AccountManager().open("default");
+    return account.canonical;
+  } catch (e: any) {
+    // 迁移：老式 credentials 文件存在但缺 descriptor 时自动补
+    try {
+      const creds = m.loadCredentials({ store: "default" });
+      ensureWereadAccountFiles(creds);
+      const account = await new m.AccountManager().open("default");
+      return account.canonical;
+    } catch {
+      throw e;
+    }
+  }
 }
 
 app.post("/api/weread/login/start", async (c) => {
@@ -405,6 +440,7 @@ app.post("/api/weread/login/start", async (c) => {
       })
       .then(async (credentials: any) => {
         m.saveCredentials(credentials, { store: "default" });
+        try { ensureWereadAccountFiles(credentials); } catch { /* non-fatal */ }
         loginState.status = "done";
         loginState.vid = String(credentials.vid);
         return credentials;
@@ -453,22 +489,48 @@ app.get("/api/weread/status", async (c) => {
 // ─── Batch export via weread-omni ───────────────────────────────────
 
 app.post("/api/batch/start", async (c) => {
-  const { url } = await c.req.json().catch(() => ({ url: "" }));
-  if (!url || !url.includes("mp.weixin.qq.com")) {
-    return c.json({ error: "请粘贴该公众号任意一篇文章的微信链接" }, 400);
+  const body = await c.req.json().catch(() => ({ url: "" }));
+  const url: string = body.url || "";
+  const name: string = (body.name || "").trim();
+  if ((!url || !url.includes("mp.weixin.qq.com")) && !name) {
+    return c.json({ error: "请粘贴该公众号任意一篇文章的微信链接，或输入公众号名称" }, 400);
   }
   try {
     const weread = await getCanonicalClient();
-    // 1. resolve article → reviewId → accountId
-    const resolution = await weread.publicAccounts.resolveArticle(url);
-    const m = /^MP_WXS_(\d+)_/.exec(resolution.reviewId);
-    if (!m) return c.json({ error: "无法从链接解析公众号 ID：" + resolution.reviewId.slice(0, 40) }, 400);
-    const accountId = m[1];
+    let accountId = "";
+    if (name && (!url || !url.includes("mp.weixin.qq.com"))) {
+      // 按名称搜索公众号（scope 2）
+      const results = await (weread as any).search.books(name, { scope: 2, count: 10 });
+      const items = results?.books || results?.items || results || [];
+      const hit = (Array.isArray(items) ? items : []).find((b: any) =>
+        (b.bookId || b.accountId || "").startsWith("MP_WXS_")
+      ) || (Array.isArray(items) ? items : [])[0];
+      accountId = hit?.bookId || hit?.accountId || "";
+      if (!accountId) return c.json({ error: `未找到公众号「${name}」，请尝试粘贴该号任意文章链接` }, 404);
+    } else {
+      // 1. resolve article → reviewId → accountId
+      const resolution = await weread.publicAccounts.resolveArticle(url);
+      console.log("[batch] reviewId =", resolution.reviewId);
+      const m = /^MP_WXS_(\d+)_/.exec(resolution.reviewId);
+      if (m) {
+        accountId = "MP_WXS_" + m[1];  // 去掉尾部下划线
+        console.log("[batch] URL 分支 accountId =", accountId);
+      } else {
+        // 非标准 reviewId：通过 review 元数据取 bookId（即 accountId）
+        const review = await (weread as any).review.single(resolution.reviewId).catch(() => null);
+        const bookId = review?.bookId || review?.review?.bookId || "";
+        if (!bookId || !/^MP_WXS_\d+$/.test(bookId)) {
+          return c.json({ error: "无法解析该公众号 ID（reviewId: " + resolution.reviewId.slice(0, 50) + "）" }, 400);
+        }
+        accountId = bookId;
+      }
+    }
 
     // 2. ensure subscription (articles API may require it)
+    console.log("[batch] subscribe+articles accountId =", accountId);
     try {
       await weread.publicAccounts.subscribe(accountId);
-    } catch { /* maybe already subscribed */ }
+    } catch (e: any) { console.log("[batch] subscribe 失败(忽略):", e?.message?.slice(0, 80)); }
 
     // 3. page through all articles
     const articles: any[] = [];
@@ -564,12 +626,16 @@ app.get("/api/batch/zip", async (c) => {
 
 
 app.get("/", (c) => {
+  c.header("Cache-Control", "no-cache, no-store, must-revalidate");
   return c.html(FRONTEND_HTML);
 });
 
-app.get("/healthz", (c) => c.text("ok"));
+app.get("/admin", (c) => {
+  c.header("Cache-Control", "no-cache, no-store, must-revalidate");
+  return c.html(ADMIN_HTML);
+});
 
-app.get("/admin", (c) => c.html(ADMIN_HTML));
+app.get("/healthz", (c) => c.text("ok"));
 
 app.notFound((c) => c.text("Not Found", 404));
 
@@ -874,6 +940,8 @@ function showBatchError(msg) { const box = document.getElementById('batch-error'
 
 // ─── Admin page HTML ────────────────────────────────────────────────
 
+// ─── Admin page HTML ────────────────────────────────────────────────
+
 const ADMIN_HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -897,7 +965,6 @@ const ADMIN_HTML = `<!DOCTYPE html>
   .acct { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #f0f0f0; }
   .acct-name { font-weight: 600; }
   .acct-id { color: #999; font-size: 12px; }
-  .del { background: #f56c6c; padding: 6px 12px; font-size: 12px; border-radius: 6px; }
   .ok { color: #07c160; font-size: 13px; }
   .warn { color: #e6a23c; font-size: 13px; }
   .err { color: #f56c6c; font-size: 13px; margin-top: 8px; display: none; }
@@ -919,7 +986,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <button onclick="startLogin()" id="addBtn">+ 扫码添加账号</button>
       </div>
       <div id="acct-list">加载中...</div>
-      <p class="hint" style="text-align:left">• 扫码登录微信读书后，账号用于抓取公众号数据<br>• 状态「今日小黑屋」表示请求过频，次日恢复<br>• 建议添加 2-3 个账号轮换</p>
+      <p class="hint" style="text-align:left">• 扫码登录微信读书后，即可批量导出公众号文章<br>• 登录状态长期有效，失效时回到此页重新扫码</p>
     </div>
     <div class="card qr-box" id="qr-card" style="display:none">
       <img id="qr-img" alt="二维码" />
@@ -931,7 +998,6 @@ const ADMIN_HTML = `<!DOCTYPE html>
 </div>
 <script>
 let ADMIN = localStorage.getItem('admin_code') || '';
-let loginUuid = null;
 let pollTimer = null;
 
 if (ADMIN) { tryEnter(); }
@@ -951,7 +1017,7 @@ async function api(path, opts = {}) {
 
 async function tryEnter() {
   try {
-    await api('/api/werss/accounts');
+    await api('/api/weread/status');
     localStorage.setItem('admin_code', ADMIN);
     document.getElementById('login-card').style.display = 'none';
     document.getElementById('main').style.display = 'block';
@@ -961,28 +1027,19 @@ async function tryEnter() {
 
 async function loadAccounts() {
   try {
-    const data = await api('/api/werss/accounts');
+    const data = await api('/api/weread/status');
     const el = document.getElementById('acct-list');
-    if (!data.items.length) { el.innerHTML = '<p class="warn">暂无账号，点击上方按钮扫码添加</p>'; return; }
-    el.innerHTML = data.items.map(a => {
-      const st = a.status === 1 ? '<span class="ok">正常</span>' : '<span class="warn">状态 ' + a.status + '</span>';
-      return '<div class="acct"><div><div class="acct-name">' + (a.name||'未命名') + '</div><div class="acct-id">' + a.id + '</div></div><div style="display:flex;gap:8px;align-items:center">' + st + '<button class="del" onclick="delAcct(\\'' + a.id + '\\')">删除</button></div></div>';
-    }).join('');
+    if (!data.loggedIn) { el.innerHTML = '<p class="warn">暂无账号，点击上方按钮扫码添加</p>'; return; }
+    el.innerHTML = '<div class="acct"><div><div class="acct-name">微信读书账号</div><div class="acct-id">vid ' + data.vid + '</div></div><span class="ok">已登录</span></div>';
   } catch (e) { document.getElementById('acct-list').textContent = '加载失败: ' + e.message; }
-}
-
-async function delAcct(id) {
-  if (!confirm('确定删除该账号？')) return;
-  await api('/api/werss/account/' + id, { method: 'DELETE' });
-  loadAccounts();
 }
 
 async function startLogin() {
   const btn = document.getElementById('addBtn');
   btn.disabled = true;
   try {
-    const data = await api('/api/werss/login/start', { method: 'POST' });
-    loginUuid = data.uuid;
+    const data = await api('/api/weread/login/start', { method: 'POST' });
+    if (data.error) throw new Error(data.error);
     document.getElementById('qr-img').src = data.qr;
     document.getElementById('qr-card').style.display = 'block';
     document.getElementById('login-status').textContent = '等待扫码...';
@@ -992,26 +1049,23 @@ async function startLogin() {
 }
 
 async function checkLogin() {
-  if (!loginUuid) return;
   try {
-    const data = await api('/api/werss/login/check?id=' + loginUuid);
-    if (data.ok) {
+    const data = await api('/api/weread/login/status');
+    if (data.status === 'done') {
       clearInterval(pollTimer);
-      document.getElementById('login-status').innerHTML = '<span class="ok">✓ 登录成功：' + data.name + '</span>';
+      document.getElementById('login-status').innerHTML = '<span class="ok">✓ 登录成功（vid ' + data.vid + '）</span>';
       setTimeout(() => { document.getElementById('qr-card').style.display = 'none'; loadAccounts(); }, 1500);
-    } else if (data.message) {
+    } else if (data.status === 'error') {
       clearInterval(pollTimer);
-      document.getElementById('login-status').innerHTML = '<span class="err show">登录失败: ' + data.message + '</span>';
+      document.getElementById('login-status').innerHTML = '<span class="err show">登录失败: ' + (data.error||'') + '</span>';
     }
   } catch (e) { /* keep polling */ }
 }
 
 function cancelLogin() {
-  loginUuid = null;
   if (pollTimer) clearInterval(pollTimer);
   document.getElementById('qr-card').style.display = 'none';
 }
 </script>
 </body>
 </html>`;
-
