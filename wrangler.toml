@@ -1,0 +1,12 @@
+name = "wechat-article-downloader"
+main = "src/index.tsx"
+compatibility_date = "2024-12-01"
+
+[vars]
+SITE_NAME = "公众号文章下载"
+SITE_URL = "https://down.yinuo-ai.com"
+
+# 自定义域名（部署后在此绑定）
+# routes = [
+#   { pattern = "down.yinuo-ai.com", custom_domain = true }
+# ]

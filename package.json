@@ -1,0 +1,15 @@
+{
+  "name": "wechat-article-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.13.13"
+  },
+  "devDependencies": {
+    "wrangler": "^4.151.0"
+  }
+}
