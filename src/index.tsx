@@ -900,7 +900,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <div class="card">
       <div class="input-group">
         <input type="url" id="url-input" placeholder="https://mp.weixin.qq.com/s/..." />
-        <button class="btn btn-primary" id="btn-fetch" onclick="fetchArticle()">下载</button>
+        <button class="btn btn-primary" id="btn-fetch" onclick="fetchArticle()">解析</button>
       </div>
       <div class="error" id="error-box"></div>
       <div class="loading" id="loading-box"><div class="spinner"></div><p style="margin-top:12px">正在获取文章内容...</p></div>
@@ -1024,7 +1024,7 @@ async function fetchArticle() {
   document.getElementById('result-box').classList.remove('show');
   if (!url || !url.includes('mp.weixin.qq.com')) { showSingleError('请输入有效的微信公众号文章链接'); return; }
   currentUrl = url;
-  btn.disabled = true; btn.textContent = '获取中...';
+  btn.disabled = true; btn.textContent = '解析中...';
   document.getElementById('loading-box').classList.add('show');
   try {
     const resp = await fetch('/api/preview?url=' + encodeURIComponent(url));
@@ -1032,7 +1032,7 @@ async function fetchArticle() {
     if (!resp.ok) throw new Error(data.error || '获取失败');
     showResult(data);
   } catch (e) { showSingleError(e.message); }
-  finally { btn.disabled = false; btn.textContent = '下载'; document.getElementById('loading-box').classList.remove('show'); }
+  finally { btn.disabled = false; btn.textContent = '解析'; document.getElementById('loading-box').classList.remove('show'); }
 }
 function showResult(data) {
   document.getElementById('result-title').textContent = data.title || '未命名文章';
