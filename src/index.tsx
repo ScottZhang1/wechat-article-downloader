@@ -402,7 +402,7 @@ function checkAdmin2(c: any): boolean {
   return !!ADMIN_CODE2 && code === ADMIN_CODE2;
 }
 
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -506,6 +506,17 @@ app.get("/api/weread/status", async (c) => {
   } catch {
     return c.json({ loggedIn: false });
   }
+});
+
+// ─── 站长二维码（收款码 / 微信二维码）：文件放 /app/data/qr/ 即生效 ───
+const QR_DIR = process.env.QR_DIR || "/app/data/qr";
+mkdirSync(QR_DIR, { recursive: true });
+[["/qr/pay.png", "pay.png"], ["/qr/wechat.png", "wechat.png"]].forEach(([route, file]) => {
+  app.get(route, (c) => {
+    const fp = join(QR_DIR, file);
+    if (!existsSync(fp)) return c.text("not configured", 404);
+    return c.body(readFileSync(fp), { headers: { "content-type": "image/png", "cache-control": "no-cache" } });
+  });
 });
 
 // 公开轻量状态：只暴露是否已登录，不含任何敏感信息
@@ -867,6 +878,19 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .renew-btn.show { display: block; }
   .renew-btn:hover { background: #fdf6ec; }
 
+  /* ───── 支付弹窗 ───── */
+  .pay-price { font-size: 34px; font-weight: 800; text-align: center; background: var(--grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .pay-price .unit { font-size: 15px; }
+  .pay-scope { text-align: center; color: var(--text-2); font-size: 13px; margin-top: 4px; }
+  .qr-row { display: flex; gap: 14px; justify-content: center; margin: 18px 0 6px; }
+  .qr-cell { flex: 1; text-align: center; }
+  .qr-cell .box { height: 170px; display: flex; align-items: center; justify-content: center; background: #f8fafd; border: 1px dashed var(--line); border-radius: 12px; overflow: hidden; }
+  .qr-cell img { max-width: 100%; max-height: 100%; }
+  .qr-cell .box .ph { color: var(--text-3); font-size: 12px; padding: 8px; text-align: center; }
+  .qr-cell .cap { font-size: 12px; color: var(--text-2); margin-top: 6px; font-weight: 600; }
+  .pay-steps { font-size: 13px; color: var(--text-2); line-height: 2; background: #f3f8ff; border: 1px solid #e3eefc; border-radius: 10px; padding: 10px 14px; margin: 14px 0; }
+  .pay-legal { font-size: 11px; color: var(--text-3); text-align: center; margin-top: 12px; line-height: 1.6; }
+
   /* ───── Modal ───── */
   .modal-overlay { position: fixed; inset: 0; background: rgba(20, 28, 45, .5); backdrop-filter: blur(4px); z-index: 999; display: none; align-items: center; justify-content: center; padding: 16px; }
   .modal-overlay.show { display: flex; }
@@ -970,6 +994,29 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
   <div class="footer">
     <a href="https://yinuo-ai.com" target="_blank">一诺 AI</a> · v2.3
+  </div>
+</div>
+
+<div class="modal-overlay" id="pay-modal">
+  <div class="modal-card">
+    <button class="modal-close" onclick="closePayModal()">×</button>
+    <div class="pay-price"><span class="unit">¥</span>9.9</div>
+    <div class="pay-scope">解锁「<span id="pay-name"></span>」全部 <span id="pay-count"></span> 篇文章打包下载</div>
+    <div class="qr-row">
+      <div class="qr-cell">
+        <div class="box"><img id="pay-qr-img" alt="收款码" /><div class="ph" style="display:none">收款码待配置</div></div>
+        <div class="cap">① 微信扫码支付 ¥9.9</div>
+      </div>
+      <div class="qr-cell">
+        <div class="box"><img id="wx-qr-img" alt="一诺微信" /><div class="ph" style="display:none">微信二维码待配置</div></div>
+        <div class="cap">② 扫码添加一诺微信</div>
+      </div>
+    </div>
+    <div class="pay-steps">
+      <b>领取方式：</b>支付后添加一诺微信，备注<b>公众号名称</b>（如「遇见一诺」），几分钟内发送 ZIP 打包文件。
+    </div>
+    <button class="big-btn" onclick="closePayModal()">我已支付，去添加微信领取</button>
+    <div class="pay-legal">仅供个人学习与备份用途，请勿传播导出内容<br>内容版权归原作者所有 · 导出后 7 天内可免费重新打包</div>
   </div>
 </div>
 
@@ -1103,7 +1150,29 @@ async function batchStart() {
 
 let zipAbort = null;
 
+const WX_PAY_ENABLED = true;  // 收费开关：改 false 恢复免费直下
+
 async function downloadZip() {
+  if (!batchArticles.length) return;
+  // 站长（浏览器里有授权密码）免单直下
+  if (!WX_PAY_ENABLED || localStorage.getItem('admin_code')) { startZipDownload(); return; }
+  // 访客：展示支付弹窗
+  document.getElementById('pay-name').textContent = batchName;
+  document.getElementById('pay-count').textContent = String(batchArticles.length);
+  document.getElementById('pay-modal').classList.add('show');
+  // 二维码图片加载失败 → 占位提示
+  ['pay-qr-img', 'wx-qr-img'].forEach(id => {
+    const img = document.getElementById(id);
+    img.onerror = () => { img.style.display = 'none'; img.nextElementSibling.style.display = 'flex'; };
+    img.style.display = 'block';
+    const ph = img.nextElementSibling; if (ph) ph.style.display = 'none';
+    img.src = (id === 'pay-qr-img' ? '/qr/pay.png' : '/qr/wechat.png') + '?t=' + Date.now();
+  });
+}
+
+function closePayModal() { document.getElementById('pay-modal').classList.remove('show'); }
+
+function startZipDownload() {
   if (!batchArticles.length) return;
   const btn = document.getElementById('btn-zip');
   const cancelBtn = document.getElementById('btn-zip-cancel');
