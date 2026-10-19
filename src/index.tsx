@@ -812,15 +812,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .spinner { display: inline-block; width: 26px; height: 26px; border: 3px solid var(--line); border-top-color: var(--brand); border-radius: 50%; animation: spin .75s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  /* ───── Features ───── */
-  .features { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; margin-top: 26px; }
-  @media (max-width: 520px) { .features { grid-template-columns: 1fr; } .input-group { flex-direction: column; } .hero h1 { font-size: 30px; } }
-  .feature { text-align: center; padding: 22px 14px; background: var(--card); border: 1px solid var(--line); border-radius: 16px; transition: transform .25s var(--ease), box-shadow .25s var(--ease); }
-  .feature:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(27,35,51,.07); }
-  .feature svg { width: 26px; height: 26px; stroke: var(--brand); margin-bottom: 10px; }
-  .feature h3 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
-  .feature p { font-size: 12px; color: var(--text-3); }
-
+  @media (max-width: 520px) { .input-group { flex-direction: column; } .hero h1 { font-size: 30px; } }
   .footer { text-align: center; padding: 44px 0 20px; color: var(--text-3); font-size: 12px; }
   .footer a { color: var(--text-2); text-decoration: none; transition: color .2s; }
   .footer a:hover { color: var(--brand); }
@@ -917,20 +909,6 @@ const FRONTEND_HTML = `<!DOCTYPE html>
           <a class="dl-btn" id="dl-html" href="#" target="_blank">⬇ 下载 HTML</a>
           <a class="dl-btn" id="dl-text" href="#">⬇ 下载 纯文本</a>
         </div>
-      </div>
-    </div>
-    <div class="features">
-      <div class="feature">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 11-14h-7l1-6z" stroke="currentColor"/></svg>
-        <h3>一键导出</h3><p>粘贴链接即可获取</p>
-      </div>
-      <div class="feature">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke="currentColor"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" stroke="currentColor"/></svg>
-        <h3>Markdown 格式</h3><p>保留图片和排版</p>
-      </div>
-      <div class="feature">
-        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6l8-4z" stroke="currentColor"/><path d="M9 12l2 2 4-4" stroke="currentColor"/></svg>
-        <h3>本地处理</h3><p>不存储任何数据</p>
       </div>
     </div>
   </div>
