@@ -914,7 +914,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   </div>
 
   <div class="footer">
-    <a href="https://yinuo-ai.com" target="_blank">一诺 AI</a> · v2.2 · 免费 · 不存数据 · <a href="/admin">管理</a>
+    <a href="https://yinuo-ai.com" target="_blank">一诺 AI</a> · v2.3 · 免费 · 不存数据
   </div>
 </div>
 
