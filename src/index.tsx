@@ -845,6 +845,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .progress-bar { height: 6px; background: #e9edf5; border-radius: 3px; overflow: hidden; margin: 18px auto; max-width: 300px; }
   .progress-bar .fill { height: 100%; background: var(--grad); border-radius: 3px; width: 40%; animation: slide 1.2s linear infinite; }
   @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+  .cancel-btn { display: none; width: 100%; margin-top: 10px; padding: 12px; font-size: 14px; background: #fff; color: var(--text-3); border: 1.5px solid var(--line); border-radius: 12px; cursor: pointer; transition: all .2s var(--ease); }
+  .cancel-btn.show { display: block; }
+  .cancel-btn:hover { color: #e05252; border-color: #f3b3b3; background: #fef1f1; }
   .art-list { max-height: 320px; overflow-y: auto; text-align: left; margin-top: 16px; background: #f8fafd; border-radius: 12px; border: 1px solid var(--line); }
   .art-item { padding: 11px 16px; border-bottom: 1px solid #eef1f6; font-size: 14px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
   .art-item:last-child { border-bottom: none; }
@@ -980,6 +983,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
           <div class="batch-label">文章列表获取完成 ✅</div>
         </div>
         <button class="big-btn" id="btn-zip" onclick="downloadZip()">📦 打包下载全部文章 (ZIP)</button>
+        <button class="cancel-btn" id="btn-zip-cancel" onclick="cancelZip()">✕ 取消打包</button>
         <div class="art-list" id="art-list"></div>
       </div>
     </div>
@@ -1117,12 +1121,18 @@ async function batchStart() {
   }
 }
 
+let zipAbort = null;
+
 async function downloadZip() {
   if (!batchArticles.length) return;
   const btn = document.getElementById('btn-zip');
-  btn.disabled = true; btn.textContent = '⏳ 正在抓取全文并打包（每 100 篇约 1~2 分钟，请勿关闭页面）...';
+  const cancelBtn = document.getElementById('btn-zip-cancel');
+  btn.disabled = true; btn.textContent = '⏳ 正在抓取全文并打包，可随时取消...';
+  cancelBtn.classList.add('show');
+  zipAbort = new AbortController();
+  let canceled = false;
   try {
-    const resp = await fetch('/api/batch/zip', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ articles: batchArticles, name: batchName }) });
+    const resp = await fetch('/api/batch/zip', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ articles: batchArticles, name: batchName }), signal: zipAbort.signal });
     if (!resp.ok) { const d = await resp.json().catch(() => ({})); throw new Error(d.error || resp.status); }
     const blob = await resp.blob();
     const a = document.createElement('a');
@@ -1130,13 +1140,27 @@ async function downloadZip() {
     a.download = batchName + '_文章导出.zip';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-  } catch (e) { alert('打包失败: ' + e.message); }
-  btn.disabled = false; btn.textContent = '📦 打包下载全部文章 (ZIP)';
+  } catch (e) {
+    if (e.name === 'AbortError') { canceled = true; }
+    else { alert('打包失败: ' + e.message); }
+  }
+  finally {
+    zipAbort = null;
+    cancelBtn.classList.remove('show');
+    btn.disabled = false; btn.textContent = '📦 打包下载全部文章 (ZIP)';
+    if (canceled) showBatchError('已取消打包。文章列表仍保留，可重新点击打包。');
+  }
+}
+
+function cancelZip() {
+  if (zipAbort) { zipAbort.abort(); }
 }
 
 function batchReset() {
+  if (zipAbort) zipAbort.abort();
   batchArticles = [];
   if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+  document.getElementById('btn-zip-cancel').classList.remove('show');
   document.getElementById('batch-url').value = '';
   document.getElementById('bs-done').classList.remove('show');
   document.getElementById('bs-input').classList.add('show');
