@@ -188,6 +188,38 @@ function extractArticle(html: string): { title: string; author: string; content:
   return { title, author, content, date };
 }
 
+// ─── Smart article fetcher: UA rotation + skeleton detection + backoff ──
+
+const FETCH_UAS = [
+  // 微信读书墨水屏设备 UA —— 微信对其返回完整正文（weread-omni 同款方案）
+  "WeRead/2.1.2 WRBrand/Onyx wr_eink Dalvik/2.1.0 (Linux; U; Android 11; BOOX Build/onyx)",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.47(0x18002f36) NetType/WIFI Language/zh_CN",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+];
+
+async function fetchArticleHtmlSmart(url: string, maxAttempts = 3): Promise<string> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        headers: {
+          "User-Agent": FETCH_UAS[attempt % FETCH_UAS.length],
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+        redirect: "follow",
+      });
+      if (!resp.ok) continue;
+      const html = await resp.text();
+      const { content } = extractArticle(html);
+      // 正文超过 300 字视为真实内容；空壳页只有几百字节框架
+      if (content && content.replace(/\s/g, "").length > 300) return html;
+      // 空壳/被限流 → 退避后换 UA 重试
+      await new Promise((r) => setTimeout(r, 1500 + attempt * 2500));
+    } catch { /* retry */ }
+  }
+  return "";
+}
+
 // ─── API: Download article ──────────────────────────────────────────
 
 app.get("/api/download", async (c) => {
@@ -199,20 +231,10 @@ app.get("/api/download", async (c) => {
   }
 
   try {
-    const resp = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      },
-      redirect: "follow",
-    });
-
-    if (!resp.ok) {
-      return c.json({ error: `无法访问文章（HTTP ${resp.status}）` }, resp.status);
+    const html = await fetchArticleHtmlSmart(url);
+    if (!html) {
+      return c.json({ error: "无法获取文章内容（可能被微信限流，请稍后再试）" }, 429);
     }
-
-    const html = await resp.text();
 
     if (html.includes("环境异常") || html.includes("请输入验证")) {
       return c.json({ error: "请求被微信限制，请稍后再试" }, 429);
@@ -559,6 +581,8 @@ app.post("/api/batch/start", async (c) => {
       return {
         title: a?.mpInfo?.title || a?.title || "未命名",
         url: a?.mpInfo?.doc_url || fallbackUrl,
+        reviewId: rid,
+        pic: a?.mpInfo?.pic_url || "",
         time: a?.createTime || a?.mpInfo?.time || 0,
         name: a?.mpInfo?.mp_name || firstName,
       };
@@ -586,31 +610,64 @@ app.post("/api/batch/zip", async (c) => {
     const zip = new JSZip();
     const queue = [...articles];
     let done = 0;
+    let wereadClient: any = null;
+    try { wereadClient = await getCanonicalClient(); } catch { /* 未登录时只能用公开链接 */ }
+    async function resolveRealUrl(art: any): Promise<string> {
+      if (wereadClient && art.reviewId) {
+        try {
+          const rev = await wereadClient.review.single(art.reviewId);
+          const mpUrl = rev?.review?.mpInfo?.doc_url || rev?.mpInfo?.doc_url;
+          if (mpUrl) return mpUrl;
+        } catch { /* fall through */ }
+      }
+      return art.url || "";
+    }
     async function worker() {
       while (queue.length) {
         const art = queue.shift()!;
         try {
-          if (!art.url) continue;
-          const resp = await fetch(art.url, {
-            headers: {
-              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            },
-          });
-          if (resp.ok) {
-            const html = await resp.text();
-            const { title, author, content, date } = extractArticle(html);
-            const body = content ? htmlToMarkdown(content, art.url) : title || art.title;
-            const t = date || (art.time ? new Date(art.time * 1000).toISOString().slice(0, 10) : "");
+          const fetchUrl = await resolveRealUrl(art);
+          let html = fetchUrl ? await fetchArticleHtmlSmart(fetchUrl) : "";
+          let fullTitle = "";
+          let fullAuthor = "";
+          let fullBody = "";
+          let fullDate = "";
+          if (html) {
+            const extracted = extractArticle(html);
+            fullTitle = extracted.title;
+            fullAuthor = extracted.author;
+            fullDate = extracted.date;
+            if (extracted.content) fullBody = htmlToMarkdown(extracted.content, fetchUrl);
+          }
+          const hasRealContent = fullBody.replace(/\s/g, "").length > 150;
+          if (hasRealContent) {
+            const body = fullBody;
+            const title = fullTitle;
+            const author = fullAuthor;
+            const t = fullDate || (art.time ? new Date(art.time * 1000).toISOString().slice(0, 10) : "");
             zip.file(
               `${String(done + 1).padStart(4, "0")}_${sanitizeFilename(title || art.title, 60)}.md`,
-              `# ${title || art.title}\n\n> 公众号：${author || art.name || name} | 日期：${t}\n> 原文：${art.url}\n\n---\n\n${body}\n`
+              `# ${title || art.title}\n\n> 公众号：${author || art.name || name} | 日期：${t}\n> 原文：${fetchUrl}\n\n---\n\n${body}\n`
+            );
+          } else {
+            // 图片消息/特殊格式：嵌入封面海报 + 说明
+            const t = art.time ? new Date(art.time * 1000).toISOString().slice(0, 10) : "";
+            const cover = art.pic || "";
+            const body = cover
+              ? `![文章海报图](${cover})\n\n> ⚠️ 此篇为图片/特殊格式消息，正文以海报图形式呈现，请点击原文查看完整内容。\n`
+              : `> ⚠️ 此篇为图片/特殊格式消息，无法提取文字内容，请点击原文查看。\n`;
+            zip.file(
+              `${String(done + 1).padStart(4, "0")}_${sanitizeFilename(art.title, 60)}.md`,
+              `# ${art.title || "未命名"}\n\n> 公众号：${art.name || name} | 日期：${t}\n> 原文：${fetchUrl || art.url}\n\n---\n\n${body}\n`
             );
           }
         } catch { /* skip failures */ }
         done++;
+        // 请求间隔，降低触发风控概率
+        await new Promise((r) => setTimeout(r, 1200));
       }
     }
-    await Promise.all(Array.from({ length: 4 }, worker));
+    await Promise.all(Array.from({ length: 3 }, worker));
 
     const manifest = {
       account: name,
