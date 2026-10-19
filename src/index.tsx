@@ -779,7 +779,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .footer a { color: #999; text-decoration: none; }
   .batch-step { display: none; }
   .batch-step.show { display: block; }
-  .batch-status { background: #fafafa; border: 1px solid #f0f0f0; border-radius: 12px; padding: 24px; text-align: center; }
+  .batch-status { background: #fafafa; border: 1px solid #f0f0f0; border-radius: 12px; padding: 24px; text-align: center; position: relative; }
+  .batch-close { position: absolute; top: 10px; right: 12px; width: 28px; height: 28px; border: none; border-radius: 50%; background: #eef0f3; color: #888; font-size: 14px; cursor: pointer; transition: all .2s; line-height: 1; }
+  .batch-close:hover { background: #f56c6c; color: #fff; }
   .batch-count { font-size: 36px; font-weight: 700; color: #07c160; margin: 10px 0; }
   .batch-count .unit { font-size: 16px; color: #999; font-weight: 400; }
   .batch-label { color: #888; font-size: 14px; }
@@ -900,13 +902,13 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
       <div class="batch-step" id="bs-done">
         <div class="batch-status">
+          <button class="batch-close" onclick="batchReset()" title="关闭，返回输入">✕</button>
           <div class="batch-label" id="done-name"></div>
           <div class="batch-count"><span id="done-count">0</span><span class="unit"> 篇</span></div>
           <div class="batch-label">文章列表获取完成 ✅</div>
         </div>
         <button class="big-btn" id="btn-zip" onclick="downloadZip()">📦 打包下载全部文章 (ZIP)</button>
         <div class="art-list" id="art-list"></div>
-        <button class="big-btn ghost" onclick="batchReset()">再导出一个公众号</button>
       </div>
     </div>
   </div>
