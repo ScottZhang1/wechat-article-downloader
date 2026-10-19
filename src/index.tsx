@@ -508,6 +508,17 @@ app.get("/api/weread/status", async (c) => {
   }
 });
 
+// 公开轻量状态：只暴露是否已登录，不含任何敏感信息
+app.get("/api/weread/public-status", async (c) => {
+  try {
+    const m = await weread();
+    m.loadCredentials({ store: "default" });
+    return c.json({ loggedIn: true });
+  } catch {
+    return c.json({ loggedIn: false });
+  }
+});
+
 // ─── Batch export via weread-omni ───────────────────────────────────
 
 app.post("/api/batch/start", async (c) => {
@@ -781,6 +792,27 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .big-btn { display: block; width: 100%; padding: 16px; font-size: 16px; background: #07c160; color: #fff; border: none; border-radius: 12px; font-weight: 700; cursor: pointer; margin-top: 16px; }
   .big-btn:disabled { background: #c0c4cc; cursor: not-allowed; }
   .big-btn.ghost { background: #fff; color: #07c160; border: 2px solid #07c160; }
+  .src-chip { display: inline-flex; align-items: center; gap: 6px; margin-top: 12px; padding: 6px 14px; font-size: 13px; border-radius: 20px; background: #fff; border: 1px solid #e5e7eb; cursor: pointer; color: #666; transition: all .2s; }
+  .src-chip:hover { border-color: #07c160; }
+  .src-chip .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .src-chip .dot.ok { background: #07c160; box-shadow: 0 0 0 3px rgba(7,193,96,.15); }
+  .src-chip .dot.bad { background: #f56c6c; box-shadow: 0 0 0 3px rgba(245,108,108,.15); animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .4 } }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 999; display: none; align-items: center; justify-content: center; padding: 16px; }
+  .modal-overlay.show { display: flex; }
+  .modal-card { background: #fff; border-radius: 16px; padding: 28px; max-width: 400px; width: 100%; position: relative; max-height: 90vh; overflow-y: auto; }
+  .modal-close { position: absolute; top: 12px; right: 16px; font-size: 22px; color: #999; cursor: pointer; background: none; border: none; line-height: 1; }
+  .modal-card h3 { font-size: 17px; margin-bottom: 16px; text-align: center; }
+  .modal-card input { width: 100%; padding: 12px 14px; font-size: 15px; border: 2px solid #e5e7eb; border-radius: 10px; outline: none; margin-bottom: 12px; }
+  .modal-card input:focus { border-color: #07c160; }
+  .modal-card .qr-box { text-align: center; padding: 8px 0; }
+  .modal-card .qr-box img { width: 220px; height: 220px; border-radius: 8px; }
+  .modal-card .hint { color: #888; font-size: 13px; margin-top: 10px; line-height: 1.7; text-align: center; }
+  .modal-card .warn { color: #e6a23c; font-size: 13px; text-align: center; margin-top: 8px; }
+  .modal-card .ok { color: #07c160; font-size: 14px; text-align: center; }
+  .renew-btn { display: none; margin-top: 12px; padding: 12px 20px; font-size: 14px; font-weight: 600; background: #fff; color: #e6a23c; border: 2px solid #e6a23c; border-radius: 10px; cursor: pointer; width: 100%; }
+  .renew-btn.show { display: block; }
+  .renew-btn:hover { background: #e6a23c; color: #fff; }
 </style>
 </head>
 <body>
@@ -788,6 +820,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   <div class="header">
     <h1>📄 公众号文章下载</h1>
     <p>单篇秒下 · 整号批量打包，导出 Markdown / HTML / 纯文本</p>
+    <div class="src-chip" id="src-chip" onclick="openLoginModal()" title="点击管理数据源授权">
+      <span class="dot" id="src-dot"></span><span id="src-text">数据源检测中...</span>
+    </div>
   </div>
 
   <div class="tabs">
@@ -841,6 +876,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         </div>
         <button class="big-btn" id="btn-batch" onclick="batchStart()">🔍 解析并获取全部文章</button>
         <div class="error" id="batch-error"></div>
+        <button class="renew-btn" id="renew-btn" onclick="openLoginModal()">📱 微信读书授权已过期，点击扫码续期</button>
         <div class="tips" style="margin-top:16px">
           💡 <strong>怎么导出一个公众号的全部文章？</strong><br>
           1. 直接输入公众号名称（如「遇见一诺」），或粘贴该号任意一篇文章链接<br>
@@ -874,6 +910,29 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
   <div class="footer">
     <a href="https://yinuo-ai.com" target="_blank">一诺 AI</a> · v2.2 · 免费 · 不存数据 · <a href="/admin">管理</a>
+  </div>
+</div>
+
+<div class="modal-overlay" id="login-modal">
+  <div class="modal-card">
+    <button class="modal-close" onclick="closeLoginModal()">×</button>
+    <h3>📱 微信读书授权</h3>
+    <div id="modal-pwd-step">
+      <p style="font-size:13px;color:#888;margin-bottom:12px;text-align:center">此操作需站长授权密码（访客无需理会）</p>
+      <input type="password" id="modal-code" placeholder="输入授权密码" />
+      <button class="big-btn" style="padding:12px" onclick="modalAuth()">确认</button>
+      <p class="hint" id="modal-err" style="color:#f56c6c;display:none"></p>
+    </div>
+    <div id="modal-qr-step" style="display:none">
+      <div class="qr-box"><img id="modal-qr-img" alt="二维码" /></div>
+      <p class="hint">请用 <b>微信</b> 扫码，打开微信读书完成授权<br>扫码成功后本页面自动继续</p>
+      <p class="warn" id="modal-status">等待扫码...</p>
+      <button class="big-btn ghost" style="padding:10px" onclick="closeLoginModal()">取消</button>
+    </div>
+    <div id="modal-done-step" style="display:none">
+      <p class="ok" style="font-size:15px">✓ 授权成功，可以继续导出了</p>
+      <button class="big-btn" style="padding:10px" onclick="closeLoginModal()">好的，去导出</button>
+    </div>
   </div>
 </div>
 
@@ -949,7 +1008,11 @@ async function batchStart() {
   try {
     const resp = await fetch('/api/batch/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || '解析失败');
+    if (!resp.ok) {
+      const err = new Error(data.error || '解析失败');
+      err.status = resp.status;
+      throw err;
+    }
     batchArticles = data.articles || [];
     batchName = data.name || data.mpId || '公众号';
     document.getElementById('done-name').textContent = '公众号：' + batchName;
@@ -962,6 +1025,7 @@ async function batchStart() {
     document.getElementById('bs-done').classList.add('show');
   } catch (e) {
     showBatchError(e.message);
+    if (e.status === 401) document.getElementById('renew-btn').classList.add('show');
     document.getElementById('bs-progress').classList.remove('show');
     document.getElementById('bs-input').classList.add('show');
   }
@@ -996,6 +1060,83 @@ function batchReset() {
   document.getElementById('bs-input').classList.add('show');
 }
 function showBatchError(msg) { const box = document.getElementById('batch-error'); box.textContent = '⚠ ' + msg; box.classList.add('show'); }
+
+// ============ 数据源状态徽章 + 授权弹窗 ============
+let modalPollTimer = null;
+
+async function refreshSrcChip() {
+  const dot = document.getElementById('src-dot');
+  const text = document.getElementById('src-text');
+  try {
+    const r = await fetch('/api/weread/public-status');
+    const d = await r.json();
+    if (d.loggedIn) { dot.className = 'dot ok'; text.textContent = '数据源正常'; }
+    else { dot.className = 'dot bad'; text.textContent = '数据源需要扫码续期，点击处理'; }
+  } catch { dot.className = 'dot bad'; text.textContent = '数据源状态未知'; }
+}
+refreshSrcChip();
+
+function openLoginModal() {
+  document.getElementById('renew-btn').classList.remove('show');
+  document.getElementById('login-modal').classList.add('show');
+  const saved = localStorage.getItem('admin_code');
+  if (saved) { modalAuthWith(saved); }
+  else {
+    document.getElementById('modal-pwd-step').style.display = 'block';
+    document.getElementById('modal-qr-step').style.display = 'none';
+    document.getElementById('modal-done-step').style.display = 'none';
+  }
+}
+function closeLoginModal() {
+  document.getElementById('login-modal').classList.remove('show');
+  if (modalPollTimer) { clearInterval(modalPollTimer); modalPollTimer = null; }
+}
+
+function modalAuth() {
+  const code = document.getElementById('modal-code').value.trim();
+  if (!code) return;
+  modalAuthWith(code);
+}
+
+async function modalApi(path, opts = {}) {
+  const resp = await fetch(path, { ...opts, headers: { 'x-admin-code': localStorage.getItem('admin_code') || '', ...(opts.headers||{}) } });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw Object.assign(new Error(data.error || resp.status), { status: resp.status });
+  return data;
+}
+
+async function modalAuthWith(code) {
+  localStorage.setItem('admin_code', code);
+  const errEl = document.getElementById('modal-err');
+  errEl.style.display = 'none';
+  try {
+    const data = await modalApi('/api/weread/login/start', { method: 'POST' });
+    if (data.error) throw new Error(data.error);
+    document.getElementById('modal-pwd-step').style.display = 'none';
+    document.getElementById('modal-qr-step').style.display = 'block';
+    document.getElementById('modal-qr-img').src = data.qr;
+    document.getElementById('modal-status').textContent = '等待扫码...';
+    modalPollTimer = setInterval(modalCheckLogin, 3000);
+  } catch (e) {
+    if (e.status === 401) { errEl.textContent = '密码错误'; errEl.style.display = 'block'; localStorage.removeItem('admin_code'); }
+    else { errEl.textContent = '启动失败: ' + e.message; errEl.style.display = 'block'; }
+  }
+}
+
+async function modalCheckLogin() {
+  try {
+    const data = await modalApi('/api/weread/login/status');
+    if (data.status === 'done') {
+      if (modalPollTimer) { clearInterval(modalPollTimer); modalPollTimer = null; }
+      document.getElementById('modal-qr-step').style.display = 'none';
+      document.getElementById('modal-done-step').style.display = 'block';
+      refreshSrcChip();
+    } else if (data.status === 'error') {
+      if (modalPollTimer) { clearInterval(modalPollTimer); modalPollTimer = null; }
+      document.getElementById('modal-status').innerHTML = '<span style="color:#f56c6c">登录失败: ' + (data.error||'') + '</span>';
+    }
+  } catch { /* keep polling */ }
+}
 </script>
 </body>
 </html>`;
