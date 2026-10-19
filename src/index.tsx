@@ -881,7 +881,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         </div>
         <button class="big-btn" id="btn-batch" onclick="batchStart()">🔍 解析并获取全部文章</button>
         <div class="error" id="batch-error"></div>
-        <button class="renew-btn" id="renew-btn" onclick="openLoginModal()">📱 微信读书授权已过期，点击扫码续期</button>
+        <button class="renew-btn" id="renew-btn" onclick="openLoginModal()">📱 微信读书未登录，点击扫码登录</button>
         <div class="tips" style="margin-top:16px">
           💡 <strong>怎么导出一个公众号的全部文章？</strong><br>
           1. 直接输入公众号名称（如「遇见一诺」），或粘贴该号任意一篇文章链接<br>
@@ -1080,7 +1080,7 @@ async function refreshSrcChip() {
     const r = await fetch('/api/weread/public-status');
     const d = await r.json();
     if (d.loggedIn) { dot.className = 'dot ok'; text.textContent = '数据源正常'; }
-    else { dot.className = 'dot bad'; text.textContent = '数据源需要扫码续期，点击处理'; }
+    else { dot.className = 'dot bad'; text.textContent = '未登录 · 点击登录'; }
   } catch { dot.className = 'dot bad'; text.textContent = '数据源状态未知'; }
 }
 refreshSrcChip();
