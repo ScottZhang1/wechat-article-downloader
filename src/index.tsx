@@ -795,12 +795,6 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .input-group input:focus { border-color: var(--brand-soft); box-shadow: 0 0 0 3px rgba(91,158,244,.15); background: #fff; }
   input::placeholder { color: #b6bed0; }
 
-  /* ───── Formats ───── */
-  .formats { display: flex; gap: 8px; flex-wrap: wrap; }
-  .format-btn { padding: 8px 18px; font-size: 13px; font-weight: 500; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; background: #fff; color: var(--text-2); transition: all .22s var(--ease); }
-  .format-btn.active { background: var(--grad); background-size: 170% 170%; color: #fff; border-color: transparent; box-shadow: 0 4px 12px rgba(47,111,202,.25); }
-  .format-btn:hover:not(.active) { border-color: var(--brand-soft); color: var(--brand); }
-
   /* ───── Results / errors ───── */
   .result { margin-top: 24px; display: none; }
   .result.show { display: block; animation: fadeUp .3s var(--ease); }
@@ -907,12 +901,6 @@ const FRONTEND_HTML = `<!DOCTYPE html>
       <div class="input-group">
         <input type="url" id="url-input" placeholder="https://mp.weixin.qq.com/s/..." />
         <button class="btn btn-primary" id="btn-fetch" onclick="fetchArticle()">下载</button>
-      </div>
-      <div class="formats">
-        <button class="format-btn active" data-format="markdown">Markdown</button>
-        <button class="format-btn" data-format="html">HTML</button>
-        <button class="format-btn" data-format="text">纯文本</button>
-        <button class="format-btn" data-format="json">JSON</button>
       </div>
       <div class="error" id="error-box"></div>
       <div class="loading" id="loading-box"><div class="spinner"></div><p style="margin-top:12px">正在获取文章内容...</p></div>
@@ -1026,15 +1014,7 @@ function switchTab(name) {
 }
 
 // ============ 单篇下载 ============
-let currentFormat = 'markdown';
 let currentUrl = '';
-document.querySelectorAll('.format-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.format-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    currentFormat = btn.dataset.format;
-  });
-});
 document.getElementById('url-input').addEventListener('keydown', e => { if (e.key === 'Enter') fetchArticle(); });
 
 async function fetchArticle() {
