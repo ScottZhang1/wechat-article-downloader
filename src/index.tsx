@@ -803,8 +803,8 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .result-meta { color: var(--text-3); font-size: 13px; margin-top: 4px; }
   .preview { background: #f8fafd; border: 1px solid var(--line); border-radius: 12px; padding: 20px; max-height: 420px; overflow-y: auto; font-size: 14px; line-height: 1.9; white-space: pre-wrap; word-break: break-word; color: var(--text-2); }
   .download-row { display: flex; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
-  .dl-btn { flex: 1; min-width: 130px; padding: 13px; font-size: 14px; font-weight: 600; border: 1.5px solid var(--line); border-radius: 12px; cursor: pointer; background: #fff; color: var(--brand); transition: all .22s var(--ease); text-align: center; text-decoration: none; display: inline-block; }
-  .dl-btn:hover { border-color: var(--brand-soft); background: #f3f8ff; transform: translateY(-1px); }
+  .dl-btn { flex: 1; min-width: 130px; padding: 13px; font-size: 14px; font-weight: 600; border: none; border-radius: 12px; cursor: pointer; background: var(--grad); background-size: 170% 170%; color: #fff !important; box-shadow: var(--glow); transition: all .25s var(--ease); text-align: center; text-decoration: none; display: inline-block; }
+  .dl-btn:hover { box-shadow: var(--glow-hover); transform: translateY(-1px); background-position: 100% 50%; }
   .error { background: #fef1f1; color: #e05252; padding: 12px 16px; border-radius: 10px; margin-top: 16px; font-size: 14px; display: none; border: 1px solid #fadcdc; }
   .error.show { display: block; }
   .loading { text-align: center; padding: 30px; color: var(--text-3); display: none; }
@@ -913,9 +913,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         </div>
         <div class="preview" id="preview"></div>
         <div class="download-row">
-          <a class="dl-btn" id="dl-markdown" href="#">📥 Markdown</a>
-          <a class="dl-btn" id="dl-html" href="#" target="_blank">🌐 HTML</a>
-          <a class="dl-btn" id="dl-text" href="#">📝 纯文本</a>
+          <a class="dl-btn" id="dl-markdown" href="#">⬇ 下载 Markdown</a>
+          <a class="dl-btn" id="dl-html" href="#" target="_blank">⬇ 下载 HTML</a>
+          <a class="dl-btn" id="dl-text" href="#">⬇ 下载 纯文本</a>
         </div>
       </div>
     </div>
