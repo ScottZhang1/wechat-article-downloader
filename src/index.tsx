@@ -498,15 +498,19 @@ app.post("/api/batch/start", async (c) => {
   try {
     const weread = await getCanonicalClient();
     let accountId = "";
+    let displayName = "";
     if (name && (!url || !url.includes("mp.weixin.qq.com"))) {
       // 按名称搜索公众号（scope 2）
       const results = await (weread as any).search.books(name, { scope: 2, count: 10 });
-      const items = results?.books || results?.items || results || [];
-      const hit = (Array.isArray(items) ? items : []).find((b: any) =>
-        (b.bookId || b.accountId || "").startsWith("MP_WXS_")
-      ) || (Array.isArray(items) ? items : [])[0];
-      accountId = hit?.bookId || hit?.accountId || "";
+      const items = results?.books || results?.items || [];
+      const arr = Array.isArray(items) ? items : [];
+      const hit = arr.find((b: any) =>
+        String(b?.bookInfo?.bookId || b?.bookId || "").startsWith("MP_WXS_")
+      );
+      accountId = hit?.bookInfo?.bookId || hit?.bookId || "";
       if (!accountId) return c.json({ error: `未找到公众号「${name}」，请尝试粘贴该号任意文章链接` }, 404);
+      displayName = hit?.bookInfo?.title || name;
+      console.log("[batch] 名称搜索命中:", displayName, "=>", accountId);
     } else {
       // 1. resolve article → reviewId → accountId
       const resolution = await weread.publicAccounts.resolveArticle(url);
@@ -547,13 +551,18 @@ app.post("/api/batch/start", async (c) => {
     }
     if (!articles.length) return c.json({ error: "未获取到文章列表，请稍后重试" }, 404);
 
-    const firstName = articles.find((a) => a?.mpInfo?.mp_name)?.mpInfo?.mp_name || accountId;
-    const items = articles.map((a) => ({
-      title: a?.mpInfo?.title || a?.title || "未命名",
-      url: a?.mpInfo?.doc_url || "",
-      time: a?.createTime || a?.mpInfo?.time || 0,
-      name: a?.mpInfo?.mp_name || firstName,
-    }));
+    const firstName = displayName || articles.find((a) => a?.mpInfo?.mp_name)?.mpInfo?.mp_name || accountId;
+    const items = articles.map((a) => {
+      const rid = a?.reviewId || "";
+      const docId = rid ? rid.replace(/^MP_WXS_\d+_/, "") : "";
+      const fallbackUrl = docId ? "https://mp.weixin.qq.com/s/" + docId : "";
+      return {
+        title: a?.mpInfo?.title || a?.title || "未命名",
+        url: a?.mpInfo?.doc_url || fallbackUrl,
+        time: a?.createTime || a?.mpInfo?.time || 0,
+        name: a?.mpInfo?.mp_name || firstName,
+      };
+    });
     return c.json({ mpId: accountId, name: firstName, count: items.length, articles: items });
   } catch (e: any) {
     const msg = e?.message || "解析失败";
@@ -568,11 +577,12 @@ app.post("/api/batch/start", async (c) => {
 });
 
 // ZIP of every article fetched from its original URL and converted to markdown
-app.get("/api/batch/zip", async (c) => {
+app.post("/api/batch/zip", async (c) => {
   const { articles, name } = await c.req.json().catch(() => ({ articles: [] as any[], name: "公众号" }));
   if (!Array.isArray(articles) || !articles.length) return c.json({ error: "缺少文章列表" }, 400);
   try {
-    const { JSZip } = await import("jszip");
+    const jszipMod: any = await import("jszip");
+    const JSZip = jszipMod.JSZip || jszipMod.default?.JSZip || jszipMod.default;
     const zip = new JSZip();
     const queue = [...articles];
     let done = 0;
@@ -686,7 +696,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .error.show { display: block; }
   .loading { text-align: center; padding: 32px; color: #999; display: none; }
   .loading.show { display: block; }
-  .spinner { display: inline-block; width: 24px; height: 24px; border: 3px solid #e5e7eb; border-top-color: #07c160; border-radius: 50%; animation: spin .8s linear infinite; }
+  .spinner { display: inline-block; width: 28px; height: 28px; border: 3px solid #e5e7eb; border-top-color: #07c160; border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .tips { margin-top: 16px; padding: 16px; background: #f0f9eb; border-radius: 8px; font-size: 13px; color: #67c23a; line-height: 1.8; }
   .features { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin-top: 32px; }
@@ -697,22 +707,23 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .feature p { font-size: 12px; color: #999; }
   .footer { text-align: center; padding: 40px 0 24px; color: #c0c4cc; font-size: 12px; }
   .footer a { color: #999; text-decoration: none; }
-  /* batch panel */
   .batch-step { display: none; }
   .batch-step.show { display: block; }
-  .batch-status { background: #fafafa; border: 1px solid #f0f0f0; border-radius: 12px; padding: 20px; text-align: center; }
-  .batch-count { font-size: 40px; font-weight: 700; color: #07c160; margin: 8px 0; }
+  .batch-status { background: #fafafa; border: 1px solid #f0f0f0; border-radius: 12px; padding: 24px; text-align: center; }
+  .batch-count { font-size: 36px; font-weight: 700; color: #07c160; margin: 10px 0; }
+  .batch-count .unit { font-size: 16px; color: #999; font-weight: 400; }
   .batch-label { color: #888; font-size: 14px; }
-  .progress-bar { height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden; margin: 16px auto; max-width: 300px; }
-  .progress-bar .fill { height: 100%; background: #07c160; border-radius: 4px; width: 30%; animation: pulse 1.5s ease-in-out infinite; }
-  @keyframes pulse { 0%,100% { opacity: .5 } 50% { opacity: 1 } }
-  .art-list { max-height: 300px; overflow-y: auto; text-align: left; margin-top: 16px; }
-  .art-item { padding: 10px 12px; border-bottom: 1px solid #f5f5f5; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
+  .progress-bar { height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden; margin: 18px auto; max-width: 300px; }
+  .progress-bar .fill { height: 100%; background: repeating-linear-gradient(45deg,#07c160 0 12px,#06ad56 12px 24px); border-radius: 4px; width: 40%; animation: slide 1.2s linear infinite; }
+  @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+  .art-list { max-height: 300px; overflow-y: auto; text-align: left; margin-top: 16px; background: #fafafa; border-radius: 12px; border: 1px solid #f0f0f0; }
+  .art-item { padding: 10px 14px; border-bottom: 1px solid #f0f0f0; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
   .art-item a { color: #333; text-decoration: none; }
   .art-item a:hover { color: #07c160; }
   .art-item .date { color: #bbb; font-size: 12px; white-space: nowrap; }
   .big-btn { display: block; width: 100%; padding: 16px; font-size: 16px; background: #07c160; color: #fff; border: none; border-radius: 12px; font-weight: 700; cursor: pointer; margin-top: 16px; }
-  .big-btn:disabled { background: #c0c4cc; }
+  .big-btn:disabled { background: #c0c4cc; cursor: not-allowed; }
+  .big-btn.ghost { background: #fff; color: #07c160; border: 2px solid #07c160; }
 </style>
 </head>
 <body>
@@ -727,7 +738,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <div class="tab" data-tab="batch" onclick="switchTab('batch')">批量导出整号</div>
   </div>
 
-  <!-- ============ 单篇下载 ============ -->
+  <!-- 单篇下载 -->
   <div class="panel show" id="panel-single">
     <div class="card">
       <div class="input-group">
@@ -764,49 +775,48 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ============ 批量导出 ============ -->
+  <!-- 批量导出 -->
   <div class="panel" id="panel-batch">
     <div class="card">
-      <!-- Step 1: input -->
       <div class="batch-step show" id="bs-input">
         <div class="input-group">
-          <input type="url" id="batch-url" placeholder="粘贴该公众号任意一篇文章链接" />
+          <input type="text" id="batch-url" placeholder="公众号名称，或粘贴该号任意文章链接" />
         </div>
-        <button class="big-btn" id="btn-batch" onclick="batchStart()">🔍 解析并同步全部文章</button>
+        <button class="big-btn" id="btn-batch" onclick="batchStart()">🔍 解析并获取全部文章</button>
         <div class="error" id="batch-error"></div>
         <div class="tips" style="margin-top:16px">
           💡 <strong>怎么导出一个公众号的全部文章？</strong><br>
-          1. 在微信里打开该公众号的<b>任意一篇</b>文章 → 右上角「...」→ 复制链接<br>
-          2. 粘贴到上面输入框 → 点击解析<br>
-          3. 等待同步完成 → 点击「打包下载 ZIP」<br>
-          ⏱️ 文章越多同步越慢（约每分钟 100 篇），请耐心等待
+          1. 直接输入公众号名称（如「遇见一诺」），或粘贴该号任意一篇文章链接<br>
+          2. 点击解析，等待文章列表出现（约 10~60 秒）<br>
+          3. 点击「打包下载 ZIP」，每 100 篇约需 1~2 分钟
         </div>
       </div>
-      <!-- Step 2: syncing progress -->
+
       <div class="batch-step" id="bs-progress">
         <div class="batch-status">
-          <div class="batch-label" id="batch-name">正在解析公众号...</div>
-          <div class="batch-count"><span id="batch-count">0</span> 篇</div>
+          <div class="spinner"></div>
+          <div class="batch-label" id="batch-name" style="margin-top:14px">正在解析公众号...</div>
+          <div class="batch-count"><span id="batch-elapsed">0</span><span class="unit"> 秒</span></div>
           <div class="progress-bar"><div class="fill"></div></div>
-          <div class="batch-label" id="batch-status-text">正在同步历史文章，文章较多时需要几分钟...</div>
+          <div class="batch-label">正在拉取全部文章列表，请勿关闭页面...</div>
         </div>
       </div>
-      <!-- Step 3: done -->
+
       <div class="batch-step" id="bs-done">
         <div class="batch-status">
           <div class="batch-label" id="done-name"></div>
-          <div class="batch-count"><span id="done-count">0</span> 篇</div>
-          <div class="batch-label">文章同步完成 ✅</div>
+          <div class="batch-count"><span id="done-count">0</span><span class="unit"> 篇</span></div>
+          <div class="batch-label">文章列表获取完成 ✅</div>
         </div>
         <button class="big-btn" id="btn-zip" onclick="downloadZip()">📦 打包下载全部文章 (ZIP)</button>
         <div class="art-list" id="art-list"></div>
-        <button class="big-btn" style="background:#fff;color:#07c160;border:2px solid #07c160" onclick="batchReset()">再导出一个公众号</button>
+        <button class="big-btn ghost" onclick="batchReset()">再导出一个公众号</button>
       </div>
     </div>
   </div>
 
   <div class="footer">
-    <a href="https://yinuo-ai.com" target="_blank">一诺 AI</a> · 免费 · 不存储任何数据 · <a href="/admin">管理</a>
+    <a href="https://yinuo-ai.com" target="_blank">一诺 AI</a> · v2.2 · 免费 · 不存数据 · <a href="/admin">管理</a>
   </div>
 </div>
 
@@ -818,9 +828,8 @@ function switchTab(name) {
   document.getElementById('panel-' + name).classList.add('show');
 }
 
-// ============ single download ============
+// ============ 单篇下载 ============
 let currentUrl = '';
-let currentFormat = 'markdown';
 document.querySelectorAll('.format-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.format-btn').forEach(b => b.classList.remove('active'));
@@ -828,6 +837,7 @@ document.querySelectorAll('.format-btn').forEach(btn => {
     currentFormat = btn.dataset.format;
   });
 });
+let currentFormat = 'markdown';
 document.getElementById('url-input').addEventListener('keydown', e => { if (e.key === 'Enter') fetchArticle(); });
 
 async function fetchArticle() {
@@ -859,75 +869,71 @@ function showResult(data) {
 }
 function showSingleError(msg) { const box = document.getElementById('error-box'); box.textContent = '⚠ ' + msg; box.classList.add('show'); }
 
-// ============ batch export ============
-let batchMpId = null;
-let pollTimer = null;
+// ============ 批量导出 ============
+let batchArticles = [];
+let batchName = '';
+let elapsedTimer = null;
 
 async function batchStart() {
-  const url = document.getElementById('batch-url').value.trim();
+  const input = document.getElementById('batch-url').value.trim();
   const btn = document.getElementById('btn-batch');
   const errBox = document.getElementById('batch-error');
   errBox.classList.remove('show');
-  if (!url || !url.includes('mp.weixin.qq.com')) { showBatchError('请粘贴该公众号任意一篇文章的微信链接'); return; }
-  btn.disabled = true; btn.textContent = '解析中...';
+  const isUrl = input.includes('mp.weixin.qq.com');
+  const payload = isUrl ? { url: input } : { name: input };
+  if (!input) { showBatchError('请输入公众号名称或文章链接'); return; }
+  btn.disabled = true;
+  document.getElementById('bs-input').classList.remove('show');
+  document.getElementById('bs-progress').classList.add('show');
+  document.getElementById('batch-name').textContent = isUrl ? '正在解析文章链接...' : ('正在搜索公众号「' + input + '」...');
+  let sec = 0;
+  document.getElementById('batch-elapsed').textContent = '0';
+  elapsedTimer = setInterval(() => { sec++; document.getElementById('batch-elapsed').textContent = String(sec); }, 1000);
   try {
-    const resp = await fetch('/api/batch/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) });
+    const resp = await fetch('/api/batch/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '解析失败');
-    batchMpId = data.mpId;
-    document.getElementById('batch-name').textContent = '公众号：' + (data.name || data.mpId);
-    document.getElementById('bs-input').classList.remove('show');
-    document.getElementById('bs-progress').classList.add('show');
-    pollTimer = setInterval(pollProgress, 5000);
-    pollProgress();
-  } catch (e) { showBatchError(e.message); }
-  finally { btn.disabled = false; btn.textContent = '🔍 解析并同步全部文章'; }
+    batchArticles = data.articles || [];
+    batchName = data.name || data.mpId || '公众号';
+    document.getElementById('done-name').textContent = '公众号：' + batchName;
+    document.getElementById('done-count').textContent = data.count || batchArticles.length;
+    document.getElementById('art-list').innerHTML = batchArticles.slice(0, 50).map(a => {
+      const d = a.time ? new Date(a.time * 1000).toISOString().slice(0, 10) : '';
+      return '<div class="art-item"><a href="' + a.url + '" target="_blank">' + (a.title || '无标题') + '</a><span class="date">' + d + '</span></div>';
+    }).join('') + (batchArticles.length > 50 ? '<div class="art-item" style="justify-content:center;color:#999">... 共 ' + batchArticles.length + ' 篇</div>' : '');
+    document.getElementById('bs-progress').classList.remove('show');
+    document.getElementById('bs-done').classList.add('show');
+  } catch (e) {
+    showBatchError(e.message);
+    document.getElementById('bs-progress').classList.remove('show');
+    document.getElementById('bs-input').classList.add('show');
+  }
+  finally {
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+    btn.disabled = false; btn.textContent = '🔍 解析并获取全部文章';
+  }
 }
 
-async function pollProgress() {
-  if (!batchMpId) return;
-  try {
-    const resp = await fetch('/api/batch/progress?mpId=' + batchMpId);
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error);
-    document.getElementById('batch-count').textContent = data.count || 0;
-    if (!data.running) {
-      clearInterval(pollTimer);
-      await showDone();
-    }
-  } catch (e) { console.error(e); }
-}
-
-async function showDone() {
-  const resp = await fetch('/api/batch/articles?mpId=' + batchMpId);
-  const data = await resp.json();
-  document.getElementById('done-name').textContent = '公众号：' + (data.name || '');
-  document.getElementById('done-count').textContent = data.count || 0;
-  document.getElementById('art-list').innerHTML = (data.articles || []).slice(0, 50).map(a => {
-    const d = a.publishTime ? new Date(a.publishTime * 1000).toISOString().slice(0, 10) : '';
-    return '<div class="art-item"><a href="' + a.url + '" target="_blank">' + a.title + '</a><span class="date">' + d + '</span></div>';
-  }).join('') + (data.count > 50 ? '<div class="art-item" style="justify-content:center;color:#999">... 共 ' + data.count + ' 篇</div>' : '');
-  document.getElementById('bs-progress').classList.remove('show');
-  document.getElementById('bs-done').classList.add('show');
-}
-
-function downloadZip() {
-  if (!batchMpId) return;
+async function downloadZip() {
+  if (!batchArticles.length) return;
   const btn = document.getElementById('btn-zip');
-  btn.disabled = true; btn.textContent = '⏳ 正在抓取全文并打包（文章多时需几分钟，请勿关闭页面）...';
-  const a = document.createElement('a');
-  a.href = '/api/batch/zip?mpId=' + batchMpId;
-  a.download = '';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  // allow repeat download
-  setTimeout(() => { btn.disabled = false; btn.textContent = '📦 打包下载全部文章 (ZIP)'; }, 8000);
+  btn.disabled = true; btn.textContent = '⏳ 正在抓取全文并打包（每 100 篇约 1~2 分钟，请勿关闭页面）...';
+  try {
+    const resp = await fetch('/api/batch/zip', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ articles: batchArticles, name: batchName }) });
+    if (!resp.ok) { const d = await resp.json().catch(() => ({})); throw new Error(d.error || resp.status); }
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = batchName + '_文章导出.zip';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  } catch (e) { alert('打包失败: ' + e.message); }
+  btn.disabled = false; btn.textContent = '📦 打包下载全部文章 (ZIP)';
 }
 
 function batchReset() {
-  batchMpId = null;
-  if (pollTimer) clearInterval(pollTimer);
+  batchArticles = [];
+  if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
   document.getElementById('batch-url').value = '';
   document.getElementById('bs-done').classList.remove('show');
   document.getElementById('bs-input').classList.add('show');
