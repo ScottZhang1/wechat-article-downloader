@@ -402,7 +402,7 @@ function checkAdmin2(c: any): boolean {
   return !!ADMIN_CODE2 && code === ADMIN_CODE2;
 }
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -516,6 +516,19 @@ app.get("/api/weread/public-status", async (c) => {
     return c.json({ loggedIn: true });
   } catch {
     return c.json({ loggedIn: false });
+  }
+});
+
+app.post("/api/weread/logout", async (c) => {
+  if (!checkAdmin2(c)) return c.json({ error: "unauthorized" }, 401);
+  try {
+    const m = await weread();
+    const root = NODE_ENV2.WEREAD_CONFIG_DIR || join(homedir(), ".config", "weread");
+    rmSync(join(root, "accounts", "default"), { recursive: true, force: true });
+    rmSync(join(root, "credentials.default.json"), { force: true });
+    return c.json({ ok: true });
+  } catch (e: any) {
+    return c.json({ error: e?.message || "退出失败" }, 500);
   }
 });
 
@@ -964,6 +977,15 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   <div class="modal-card">
     <button class="modal-close" onclick="closeLoginModal()">×</button>
     <h3>📱 微信读书授权</h3>
+    <div id="modal-user-step" style="display:none">
+      <p style="font-size:14px;text-align:center;color:var(--text-2)">当前已登录微信读书账号</p>
+      <p class="ok" style="text-align:center;margin-top:6px">vid <span id="modal-cur-vid"></span></p>
+      <div style="display:flex;gap:10px;margin-top:18px">
+        <button class="big-btn" style="flex:1;padding:12px;margin-top:0" onclick="modalRescan()">重新扫码登录</button>
+        <button class="big-btn ghost" style="flex:1;padding:12px;margin-top:0;color:#e05252" onclick="modalLogout()">退出登录</button>
+      </div>
+      <p class="hint" style="margin-top:12px">账号被风控或需换号时，可退出后重新扫码</p>
+    </div>
     <div id="modal-pwd-step">
       <p style="font-size:13px;color:var(--text-3);margin-bottom:12px;text-align:center">此操作需站长授权密码（访客无需理会）</p>
       <input type="password" id="modal-code" placeholder="输入授权密码" />
@@ -1144,12 +1166,42 @@ function openLoginModal() {
   document.getElementById('renew-btn').classList.remove('show');
   document.getElementById('login-modal').classList.add('show');
   const saved = localStorage.getItem('admin_code');
-  if (saved) { modalAuthWith(saved); }
-  else {
-    document.getElementById('modal-pwd-step').style.display = 'block';
-    document.getElementById('modal-qr-step').style.display = 'none';
-    document.getElementById('modal-done-step').style.display = 'none';
+  if (!saved) {
+    showModalStep('modal-pwd-step');
+    return;
   }
+  // 已存密码：先查登录态，已登录 → 账号管理步骤；未登录 → 直接扫码
+  modalApi('/api/weread/status').then(st => {
+    if (st.loggedIn) {
+      document.getElementById('modal-cur-vid').textContent = st.vid || '';
+      showModalStep('modal-user-step');
+    } else {
+      modalAuthWith(saved);
+    }
+  }).catch(e => {
+    if (e.status === 401) { localStorage.removeItem('admin_code'); showModalStep('modal-pwd-step'); }
+    else showModalStep('modal-pwd-step');
+  });
+}
+
+function showModalStep(id) {
+  ['modal-user-step', 'modal-pwd-step', 'modal-qr-step', 'modal-done-step'].forEach(x => {
+    document.getElementById(x).style.display = (x === id) ? 'block' : 'none';
+  });
+}
+
+async function modalRescan() {
+  const saved = localStorage.getItem('admin_code');
+  if (saved) modalAuthWith(saved);
+}
+
+async function modalLogout() {
+  if (!confirm('确定退出登录？退出后批量导出不可用，需重新扫码。')) return;
+  try {
+    await modalApi('/api/weread/logout', { method: 'POST' });
+    closeLoginModal();
+    refreshSrcChip();
+  } catch (e) { alert('退出失败: ' + e.message); }
 }
 function closeLoginModal() {
   document.getElementById('login-modal').classList.remove('show');
