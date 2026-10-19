@@ -403,6 +403,7 @@ function checkAdmin2(c: any): boolean {
 }
 
 import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { randomInt } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -517,6 +518,75 @@ mkdirSync(QR_DIR, { recursive: true });
     if (!existsSync(fp)) return c.text("not configured", 404);
     return c.body(readFileSync(fp), { headers: { "content-type": "image/png", "cache-control": "no-cache" } });
   });
+});
+
+// ─── 导出账号码系统（¥9.9 单号买断，7 天可重下）───
+const CODES_FILE = process.env.CODES_FILE || "/app/data/codes.json";
+interface ExportCode {
+  code: string;
+  createdAt: number;
+  note?: string;
+  activatedAt?: number;
+  boundAccountId?: string;
+  expiresAt?: number;
+}
+function loadCodes(): ExportCode[] {
+  try { return JSON.parse(readFileSync(CODES_FILE, "utf8")) as ExportCode[]; } catch { return []; }
+}
+function saveCodes(list: ExportCode[]): void {
+  mkdirSync(CODES_FILE.slice(0, CODES_FILE.lastIndexOf("/")), { recursive: true });
+  writeFileSync(CODES_FILE, JSON.stringify(list, null, 2));
+}
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function genCode(): string {
+  const seg = (): string => Array.from({ length: 4 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join("");
+  let code = "";
+  do { code = `YN-${seg()}-${seg()}`; } while (loadCodes().some((c) => c.code === code));
+  return code;
+}
+const REDEEM_VALID_DAYS = 7;
+
+// 站长：生成账号码（在授权弹窗/管理页操作）
+app.post("/api/weread/gen-code", async (c) => {
+  if (!checkAdmin2(c)) return c.json({ error: "unauthorized" }, 401);
+  const body = await c.req.json().catch(() => ({ note: "" }));
+  const code = genCode();
+  const list = loadCodes();
+  list.push({ code, createdAt: Date.now(), note: String(body?.note || "").slice(0, 60) });
+  saveCodes(list);
+  return c.json({ code, note: body?.note || "" });
+});
+
+// 站长：查看全部账号码
+app.get("/api/weread/codes", async (c) => {
+  if (!checkAdmin2(c)) return c.json({ error: "unauthorized" }, 401);
+  return c.json({ codes: loadCodes().sort((a, b) => b.createdAt - a.createdAt).slice(0, 100) });
+});
+
+// 用户：激活账号码（绑定公众号，7 天有效）
+app.post("/api/redeem", async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const code = String(body?.code || "").trim().toUpperCase();
+  const accountId = String(body?.accountId || "").trim();
+  if (!code || !accountId) return c.json({ error: "请输入账号码" }, 400);
+  const rec = loadCodes().find((x) => x.code === code);
+  if (!rec) return c.json({ error: "账号码不存在，请核对后重试" }, 402);
+  if (rec.boundAccountId && rec.boundAccountId !== accountId) {
+    return c.json({ error: "该账号码已绑定其他公众号，如需导出其他公众号请购买新账号" }, 402);
+  }
+  if (rec.expiresAt && Date.now() > rec.expiresAt) {
+    return c.json({ error: "账号码已过期（有效期 7 天）" }, 402);
+  }
+  if (!rec.activatedAt) {
+    rec.activatedAt = Date.now();
+    rec.boundAccountId = accountId;
+    rec.expiresAt = rec.activatedAt + REDEEM_VALID_DAYS * 24 * 3600 * 1000;
+    const list = loadCodes();
+    const idx = list.findIndex((x) => x.code === code);
+    if (idx >= 0) list[idx] = rec;
+    saveCodes(list);
+  }
+  return c.json({ ok: true, code: rec.code, expiresAt: rec.expiresAt, boundAccountId: rec.boundAccountId });
 });
 
 // 公开轻量状态：只暴露是否已登录，不含任何敏感信息
@@ -639,8 +709,20 @@ app.post("/api/batch/start", async (c) => {
 
 // ZIP of every article fetched from its original URL and converted to markdown
 app.post("/api/batch/zip", async (c) => {
-  const { articles, name } = await c.req.json().catch(() => ({ articles: [] as any[], name: "公众号" }));
+  const { articles, name, accountId = "" } = await c.req.json().catch(() => ({ articles: [] as any[], name: "公众号", accountId: "" }));
   if (!Array.isArray(articles) || !articles.length) return c.json({ error: "缺少文章列表" }, 400);
+  const exportCode = (c.req.header("x-export-code") || "").trim().toUpperCase();
+  const isAdminReq = checkAdmin2(c);
+  if (!isAdminReq) {
+    if (!exportCode) return c.json({ error: "需要导出账号（¥9.9/号）", needCode: true }, 402);
+    const rec = loadCodes().find((x) => x.code === exportCode);
+    if (!rec) return c.json({ error: "账号码不存在，请核对后重试", needCode: true }, 402);
+    if (!rec.activatedAt) return c.json({ error: "账号码尚未激活", needCode: true }, 402);
+    if (rec.expiresAt && Date.now() > rec.expiresAt) return c.json({ error: "账号码已过期（有效期 7 天）", needCode: true }, 402);
+    if (rec.boundAccountId && accountId && rec.boundAccountId !== accountId) {
+      return c.json({ error: "该账号码已绑定其他公众号，如需导出其他公众号请购买新账号", needCode: true }, 402);
+    }
+  }
   try {
     const jszipMod: any = await import("jszip");
     const JSZip = jszipMod.JSZip || jszipMod.default?.JSZip || jszipMod.default;
@@ -890,6 +972,14 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .qr-cell .cap { font-size: 12px; color: var(--text-2); margin-top: 6px; font-weight: 600; }
   .pay-steps { font-size: 13px; color: var(--text-2); line-height: 2; background: #f3f8ff; border: 1px solid #e3eefc; border-radius: 10px; padding: 10px 14px; margin: 14px 0; }
   .pay-legal { font-size: 11px; color: var(--text-3); text-align: center; margin-top: 12px; line-height: 1.6; }
+  .pay-tabs { display: flex; gap: 6px; margin: 16px 0 14px; background: #f3f5fa; padding: 4px; border-radius: 10px; }
+  .pay-tab { flex: 1; text-align: center; padding: 9px; font-size: 13px; font-weight: 600; border-radius: 8px; cursor: pointer; color: var(--text-2); transition: all .2s var(--ease); }
+  .pay-tab.active { background: #fff; color: var(--brand); box-shadow: 0 1px 4px rgba(27,35,51,.08); }
+  .pay-pane { display: none; }
+  .pay-pane.show { display: block; animation: fadeUp .25s var(--ease); }
+  .code-copy { display: inline-block; padding: 10px 22px; font-size: 15px; font-weight: 700; letter-spacing: 1px; background: #f3f8ff; color: var(--brand); border: 1.5px dashed var(--brand-soft); border-radius: 10px; cursor: pointer; transition: all .2s var(--ease); }
+  .code-copy:hover { background: #e8f1ff; }
+  .code-copy.copied { border-style: solid; color: #22b573; border-color: #22b573; background: #f0fbf5; }
 
   /* ───── Modal ───── */
   .modal-overlay { position: fixed; inset: 0; background: rgba(20, 28, 45, .5); backdrop-filter: blur(4px); z-index: 999; display: none; align-items: center; justify-content: center; padding: 16px; }
@@ -1002,6 +1092,11 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <button class="modal-close" onclick="closePayModal()">×</button>
     <div class="pay-price"><span class="unit">¥</span>9.9</div>
     <div class="pay-scope">解锁「<span id="pay-name"></span>」全部 <span id="pay-count"></span> 篇文章打包下载</div>
+    <div class="pay-tabs">
+      <div class="pay-tab active" data-ptab="wechat" onclick="switchPayTab('wechat')">微信支付开通</div>
+      <div class="pay-tab" data-ptab="code" onclick="switchPayTab('code')">已有账号码激活</div>
+    </div>
+    <div class="pay-pane show" id="pane-wechat">
     <div class="qr-row">
       <div class="qr-cell">
         <div class="box"><img id="pay-qr-img" alt="收款码" /><div class="ph" style="display:none">收款码待配置</div></div>
@@ -1016,7 +1111,20 @@ const FRONTEND_HTML = `<!DOCTYPE html>
       <b>领取方式：</b>支付后添加一诺微信，备注<b>公众号名称</b>（如「遇见一诺」），几分钟内发送 ZIP 打包文件。
     </div>
     <button class="big-btn" onclick="closePayModal()">我已支付，去添加微信领取</button>
-    <div class="pay-legal">仅供个人学习与备份用途，请勿传播导出内容<br>内容版权归原作者所有 · 导出后 7 天内可免费重新打包</div>
+    <div class="pay-legal">仅供个人学习与备份用途，请勿传播导出内容<br>内容版权归原作者所有 · 开通后 7 天内可免费重新打包</div>
+    </div>
+    <div class="pay-pane" id="pane-code">
+      <p style="font-size:13px;color:var(--text-2);text-align:center;margin-bottom:12px">输入开通时获得的导出账号码（形如 YN-XXXX-XXXX）</p>
+      <input type="text" id="redeem-code" placeholder="YN-XXXX-XXXX" style="width:100%;padding:0 14px;height:46px;font-size:15px;letter-spacing:1px;border:1.5px solid var(--line);border-radius:10px;outline:none;text-align:center" />
+      <button class="big-btn" style="padding:12px" onclick="activateCode()">激活并下载</button>
+      <p class="hint" id="redeem-err" style="color:#e05252;display:none;text-align:center;margin-top:10px"></p>
+      <div id="redeem-done" style="display:none;text-align:center">
+        <p class="ok" style="font-size:14px">✓ 开通成功！7 天内可随时重新下载</p>
+        <p style="font-size:13px;color:var(--text-2);margin:10px 0 6px">你的导出账号（点击复制，建议保存）：</p>
+        <button class="code-copy" onclick="copyExportCode(this)"><span class="code-text"></span></button>
+        <p style="font-size:12px;color:var(--text-3);margin-top:8px">正在自动开始下载...</p>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1030,6 +1138,10 @@ const FRONTEND_HTML = `<!DOCTYPE html>
       <div style="display:flex;gap:10px;margin-top:18px">
         <button class="big-btn" style="flex:1;padding:12px;margin-top:0" onclick="modalRescan()">重新扫码登录</button>
         <button class="big-btn ghost" style="flex:1;padding:12px;margin-top:0;color:#e05252" onclick="modalLogout()">退出登录</button>
+      </div>
+      <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line)">
+        <button class="big-btn ghost" style="padding:11px" onclick="adminGenCode()">💰 生成导出账号（¥9.9 已收款后点此）</button>
+        <div id="admin-gen-result" style="margin-top:10px;font-size:14px;text-align:center"></div>
       </div>
       <p class="hint" style="margin-top:12px">账号被风控或需换号时，可退出后重新扫码</p>
     </div>
@@ -1155,7 +1267,7 @@ const WX_PAY_ENABLED = true;  // 收费开关：改 false 恢复免费直下
 async function downloadZip() {
   if (!batchArticles.length) return;
   // 站长（浏览器里有授权密码）免单直下
-  if (!WX_PAY_ENABLED || localStorage.getItem('admin_code')) { startZipDownload(); return; }
+  if (!WX_PAY_ENABLED || localStorage.getItem('admin_code') || localStorage.getItem('export_code')) { startZipDownload(); return; }
   // 访客：展示支付弹窗
   document.getElementById('pay-name').textContent = batchName;
   document.getElementById('pay-count').textContent = String(batchArticles.length);
@@ -1172,6 +1284,55 @@ async function downloadZip() {
 
 function closePayModal() { document.getElementById('pay-modal').classList.remove('show'); }
 
+function switchPayTab(name) {
+  document.querySelectorAll('.pay-tab').forEach(t => t.classList.toggle('active', t.dataset.ptab === name));
+  document.querySelectorAll('.pay-pane').forEach(p => p.classList.remove('show'));
+  document.getElementById('pane-' + name).classList.add('show');
+}
+
+async function activateCode() {
+  const input = document.getElementById('redeem-code');
+  const errEl = document.getElementById('redeem-err');
+  errEl.style.display = 'none';
+  const code = input.value.trim().toUpperCase();
+  if (!code) { errEl.textContent = '请输入账号码'; errEl.style.display = 'block'; return; }
+  try {
+    const r = await fetch('/api/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, accountId: batchMpId }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || '激活失败');
+    localStorage.setItem('export_code', d.code);
+    document.getElementById('pane-code').querySelector('p,input,.big-btn,#redeem-err').style.display = 'none';
+    const done = document.getElementById('redeem-done');
+    done.style.display = 'block';
+    done.querySelector('.code-text').textContent = d.code;
+    setTimeout(() => startZipDownload(), 900);
+  } catch (e) {
+    errEl.textContent = e.message; errEl.style.display = 'block';
+  }
+}
+
+function copyExportCode(btn) {
+  const code = btn.querySelector('.code-text').textContent;
+  const done = () => { btn.classList.add('copied'); btn.querySelector('.code-text').textContent = '已复制 ✓'; setTimeout(() => { btn.classList.remove('copied'); btn.querySelector('.code-text').textContent = code; }, 1500); };
+  if (navigator.clipboard) navigator.clipboard.writeText(code).then(done).catch(() => fallbackCopy(code, done));
+  else fallbackCopy(code, done);
+}
+function fallbackCopy(text, cb) {
+  const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); cb(); } catch {} ta.remove();
+}
+
+// ============ 站长：生成导出账号 ============
+async function adminGenCode() {
+  const note = prompt('备注（可选）：付款用户微信昵称等') || '';
+  try {
+    const data = await modalApi('/api/weread/gen-code', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ note }) });
+    const el = document.getElementById('admin-gen-result');
+    el.innerHTML = '账号码：<b>' + data.code + '</b> <button class="code-copy" style="padding:6px 14px;font-size:13px" onclick="copyExportCode(this)"><span class="code-text">' + data.code + '</span></button><br><span style="font-size:12px;color:var(--text-3)">已同时复制，直接微信粘贴发给用户即可</span>';
+    try { await navigator.clipboard.writeText(data.code); } catch {}
+  } catch (e) { alert('生成失败: ' + e.message); }
+}
+
 function startZipDownload() {
   if (!batchArticles.length) return;
   const btn = document.getElementById('btn-zip');
@@ -1181,7 +1342,11 @@ function startZipDownload() {
   zipAbort = new AbortController();
   let canceled = false;
   try {
-    const resp = await fetch('/api/batch/zip', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ articles: batchArticles, name: batchName }), signal: zipAbort.signal });
+    const resp = await fetch('/api/batch/zip', { method: 'POST', headers: { 'content-type': 'application/json', 'x-export-code': localStorage.getItem('export_code') || '' }, body: JSON.stringify({ articles: batchArticles, name: batchName, accountId: batchMpId }), signal: zipAbort.signal });
+    if (resp.status === 402) {
+      const d = await resp.json().catch(() => ({}));
+      const err = new Error(d.error || '需要导出账号'); err.needCode = true; throw err;
+    }
     if (!resp.ok) { const d = await resp.json().catch(() => ({})); throw new Error(d.error || resp.status); }
     const blob = await resp.blob();
     const a = document.createElement('a');
@@ -1191,6 +1356,7 @@ function startZipDownload() {
     setTimeout(() => URL.revokeObjectURL(a.href), 60000);
   } catch (e) {
     if (e.name === 'AbortError') { canceled = true; }
+    else if (e.needCode) { openPayModal(); }
     else { alert('打包失败: ' + e.message); }
   }
   finally {

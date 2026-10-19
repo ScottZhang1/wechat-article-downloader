@@ -9,10 +9,10 @@
   "dependencies": {
     "@hono/node-server": "^1.13.0",
     "hono": "^4.13.13",
-    "tsx": "^4.19.0",
-    "weread-omni": "latest",
+    "jszip": "^3.10.2",
     "qrcode": "^1.5.4",
-    "jszip": "^3.10.1"
+    "tsx": "^4.19.0",
+    "weread-omni": "latest"
   },
   "devDependencies": {
     "wrangler": "^4.151.0"
