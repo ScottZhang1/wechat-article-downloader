@@ -589,8 +589,10 @@ app.post("/api/batch/start", async (c) => {
       const rid = a?.reviewId || "";
       const docId = rid ? rid.replace(/^MP_WXS_\d+_/, "") : "";
       const fallbackUrl = docId ? "https://mp.weixin.qq.com/s/" + docId : "";
+      const rawTitle = a?.mpInfo?.title || a?.title || "未命名";
+      const hasRealTitle = rawTitle.length <= 64;
       return {
-        title: a?.mpInfo?.title || a?.title || "未命名",
+        title: hasRealTitle ? rawTitle : rawTitle.slice(0, 40) + "…",
         url: a?.mpInfo?.doc_url || fallbackUrl,
         reviewId: rid,
         pic: a?.mpInfo?.pic_url || "",
@@ -786,8 +788,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
   .art-list { max-height: 300px; overflow-y: auto; text-align: left; margin-top: 16px; background: #fafafa; border-radius: 12px; border: 1px solid #f0f0f0; }
   .art-item { padding: 10px 14px; border-bottom: 1px solid #f0f0f0; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
-  .art-item a { color: #333; text-decoration: none; }
+  .art-item a { flex: 1; min-width: 0; color: #333; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .art-item a:hover { color: #07c160; }
+  .art-item.cover-note { color: #e6a23c; }
   .art-item .date { color: #bbb; font-size: 12px; white-space: nowrap; }
   .big-btn { display: block; width: 100%; padding: 16px; font-size: 16px; background: #07c160; color: #fff; border: none; border-radius: 12px; font-weight: 700; cursor: pointer; margin-top: 16px; }
   .big-btn:disabled { background: #c0c4cc; cursor: not-allowed; }
@@ -1019,7 +1022,11 @@ async function batchStart() {
     document.getElementById('done-count').textContent = data.count || batchArticles.length;
     document.getElementById('art-list').innerHTML = batchArticles.slice(0, 50).map(a => {
       const d = a.time ? new Date(a.time * 1000).toISOString().slice(0, 10) : '';
-      return '<div class="art-item"><a href="' + a.url + '" target="_blank">' + (a.title || '无标题') + '</a><span class="date">' + d + '</span></div>';
+      const t = (a.title || '无标题');
+      const esc = t.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+      const isCover = !a.url || a.url.length < 10;
+      const mark = isCover ? '🖼️ ' : '';
+      return '<div class="art-item' + (isCover ? ' cover-note' : '') + '"><a href="' + (a.url || 'javascript:void(0)') + '" target="_blank" title="' + esc + '">' + mark + t + '</a><span class="date">' + d + '</span></div>';
     }).join('') + (batchArticles.length > 50 ? '<div class="art-item" style="justify-content:center;color:#999">... 共 ' + batchArticles.length + ' 篇</div>' : '');
     document.getElementById('bs-progress').classList.remove('show');
     document.getElementById('bs-done').classList.add('show');
