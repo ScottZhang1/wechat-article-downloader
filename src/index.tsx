@@ -698,10 +698,10 @@ app.post("/api/batch/start", async (c) => {
   } catch (e: any) {
     const msg = e?.message || "解析失败";
     if (msg.includes("-2041") || msg.includes("验证")) {
-      return c.json({ error: "微信读书触发人机验证，请在微信读书 App 完成验证后重试" }, 429);
+      return c.json({ error: "数据源暂时受限，请稍后再试或联系站长。" }, 429);
     }
     if (msg.includes("credentials") || msg.includes("login") || msg.includes("登录")) {
-      return c.json({ error: "微信读书账号未登录或已失效，请到管理页重新扫码" }, 401);
+      return c.json({ error: "数据源暂时不可用，请稍后再试或联系站长。" }, 401);
     }
     return c.json({ error: msg }, 500);
   }
@@ -868,7 +868,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .hero h1 { font-size: 40px; line-height: 1.25; font-weight: 800; letter-spacing: .5px; margin-bottom: 14px; }
   .grad-text { background: var(--grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
   .hero .sub { color: var(--text-2); font-size: 16px; }
-  .src-chip { display: inline-flex; align-items: center; gap: 7px; margin-top: 20px; padding: 7px 16px; font-size: 13px; font-weight: 500; border-radius: 999px; background: rgba(255,255,255,.8); border: 1px solid var(--line); cursor: pointer; color: var(--text-2); transition: border-color .25s var(--ease), box-shadow .25s var(--ease); backdrop-filter: blur(6px); }
+  .src-chip { display: inline-flex; align-items: center; gap: 7px; margin-top: 20px; padding: 7px 16px; font-size: 13px; font-weight: 500; border-radius: 999px; background: rgba(255,255,255,.8); border: 1px solid var(--line); cursor: default; color: var(--text-2); transition: border-color .25s var(--ease), box-shadow .25s var(--ease); backdrop-filter: blur(6px); }
   .src-chip:hover { border-color: var(--brand-soft); box-shadow: 0 4px 14px rgba(47,111,202,.12); }
   .src-chip .dot { width: 8px; height: 8px; border-radius: 50%; }
   .src-chip .dot.ok { background: #22b573; box-shadow: 0 0 0 3px rgba(34,181,115,.16); }
@@ -1004,7 +1004,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <div class="eyebrow">WECHAT ARTICLE TOOLKIT</div>
     <h1>公众号文章，<span class="grad-text">一键导出</span></h1>
     <p class="sub">单篇秒下 · 整号批量打包 · Markdown / HTML / 纯文本</p>
-    <button class="src-chip" id="src-chip" onclick="openLoginModal()" title="点击管理数据源授权">
+    <button class="src-chip" id="src-chip" title="数据源状态">
       <span class="dot" id="src-dot"></span><span id="src-text">数据源检测中...</span>
     </button>
   </header>
@@ -1049,7 +1049,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         </div>
         <button class="big-btn" id="btn-batch" onclick="batchStart()">🔍 解析并获取全部文章</button>
         <div class="error" id="batch-error"></div>
-        <button class="renew-btn" id="renew-btn" onclick="openLoginModal()">📱 微信读书未登录，点击扫码登录</button>
+        <div class="renew-btn" id="renew-btn">数据源暂时不可用，请稍后再试或联系站长。</div>
         <div class="tips" style="margin-top:16px">
           💡 <strong>怎么导出一个公众号的全部文章？</strong><br>
           1. 直接输入公众号名称（如「遇见一诺」），或粘贴该号任意一篇文章链接<br>
@@ -1392,7 +1392,7 @@ async function refreshSrcChip() {
     const r = await fetch('/api/weread/public-status');
     const d = await r.json();
     if (d.loggedIn) { dot.className = 'dot ok'; text.textContent = '数据源正常'; }
-    else { dot.className = 'dot bad'; text.textContent = '未登录 · 点击登录'; }
+    else { dot.className = 'dot bad'; text.textContent = '数据源维护中'; }
   } catch { dot.className = 'dot bad'; text.textContent = '数据源状态未知'; }
 }
 refreshSrcChip();
