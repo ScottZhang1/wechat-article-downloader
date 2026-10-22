@@ -1333,7 +1333,7 @@ async function adminGenCode() {
   } catch (e) { alert('生成失败: ' + e.message); }
 }
 
-function startZipDownload() {
+async function startZipDownload() {
   if (!batchArticles.length) return;
   const btn = document.getElementById('btn-zip');
   const cancelBtn = document.getElementById('btn-zip-cancel');
