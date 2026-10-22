@@ -394,23 +394,46 @@ interface LoginState {
   vid?: string;
   error?: string;
   promise?: Promise<any>;
+  updatedAt?: number;
 }
+type SessionId = string;
+const userLoginStates = new Map<SessionId, LoginState & { updatedAt: number }>();
+const USER_LOGIN_TTL_MS = 60 * 60 * 1000;
 const loginState: LoginState = { status: "idle" };
+
+function getSessionId(c: any): SessionId | null {
+  const sid = String(c.req.header("x-weread-session") || "").trim();
+  return /^[A-Za-z0-9_-]{16,64}$/.test(sid) ? sid : null;
+}
+
+function getUserLoginState(sessionId: SessionId, create = false): LoginState {
+  const now = Date.now();
+  for (const [key, value] of userLoginStates) {
+    if (!value.updatedAt || now - value.updatedAt > USER_LOGIN_TTL_MS) userLoginStates.delete(key);
+  }
+  let state = userLoginStates.get(sessionId);
+  if (!state && create) {
+    state = { status: "idle", updatedAt: now };
+    userLoginStates.set(sessionId, state);
+  }
+  if (state) state.updatedAt = now;
+  return state || { status: "idle", updatedAt: now };
+}
 
 function checkAdmin2(c: any): boolean {
   const code = c.req.header("x-admin-code") || c.req.query("code");
   return !!ADMIN_CODE2 && code === ADMIN_CODE2;
 }
 
-import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { randomInt } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 /** AccountManager 需要 descriptor + client state 文件，登录后手动补齐（旧版迁移兼容）。 */
-function ensureWereadAccountFiles(creds: any): void {
+function ensureWereadAccountFiles(creds: any, store = "default"): void {
   const root = NODE_ENV2.WEREAD_CONFIG_DIR || join(homedir(), ".config", "weread");
-  const dir = join(root, "accounts", "default");
+  const dir = join(root, "accounts", store);
   mkdirSync(join(dir, "clients"), { recursive: true, mode: 0o700 });
   const state = {
     version: 1,
@@ -426,22 +449,43 @@ function ensureWereadAccountFiles(creds: any): void {
   writeFileSync(join(root, "config.json"), JSON.stringify({ version: 1, defaultAccount: "default" }), { mode: 0o600 });
 }
 
-async function getCanonicalClient() {
+async function getCanonicalClient(store = "default") {
   const m = await weread();
   try {
-    const account = await new m.AccountManager().open("default");
+    const account = await new m.AccountManager().open(store);
     return account.canonical;
   } catch (e: any) {
-    // 迁移：老式 credentials 文件存在但缺 descriptor 时自动补
+    // 兼容：老式 credentials 文件存在但缺 descriptor 时自动补
     try {
-      const creds = m.loadCredentials({ store: "default" });
-      ensureWereadAccountFiles(creds);
-      const account = await new m.AccountManager().open("default");
+      const creds = m.loadCredentials({ store });
+      ensureWereadAccountFiles(creds, store);
+      const account = await new m.AccountManager().open(store);
       return account.canonical;
     } catch {
       throw e;
     }
   }
+}
+
+function cleanupExpiredUserStores(): void {
+  const root = NODE_ENV2.WEREAD_CONFIG_DIR || join(homedir(), ".config", "weread");
+  try {
+    for (const name of readdirSync(join(root, "accounts"))) {
+      if (!name.startsWith("user-")) continue;
+      const dir = join(root, "accounts", name);
+      try {
+        if (Date.now() - statSync(dir).mtimeMs > 7 * 24 * 3600 * 1000) {
+          rmSync(dir, { recursive: true, force: true });
+          rmSync(join(root, `credentials.${name}.json`), { force: true });
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+async function getUserCanonicalClient(sessionId: SessionId) {
+  cleanupExpiredUserStores();
+  return getCanonicalClient(`user-${sessionId}`);
 }
 
 app.post("/api/weread/login/start", async (c) => {
@@ -463,7 +507,7 @@ app.post("/api/weread/login/start", async (c) => {
       })
       .then(async (credentials: any) => {
         m.saveCredentials(credentials, { store: "default" });
-        try { ensureWereadAccountFiles(credentials); } catch { /* non-fatal */ }
+        try { ensureWereadAccountFiles(credentials, "default"); } catch { /* non-fatal */ }
         loginState.status = "done";
         loginState.vid = String(credentials.vid);
         return credentials;
@@ -600,6 +644,90 @@ app.get("/api/weread/public-status", async (c) => {
   }
 });
 
+
+// ─── 普通用户：独立微信读书会话 ───
+
+app.post("/api/weread/user/login/start", async (c) => {
+  const sessionId = getSessionId(c);
+  if (!sessionId) return c.json({ error: "浏览器会话无效，请刷新页面" }, 400);
+  const state = getUserLoginState(sessionId, true);
+  if (state.status === "pending") {
+    return c.json({ already: true, qr: state.qrDataUrl });
+  }
+  try {
+    const m = await weread();
+    state.status = "pending";
+    state.error = undefined;
+    state.qrDataUrl = undefined;
+    const store = `user-${sessionId}`;
+    const qrcode = await import("qrcode");
+    state.promise = m
+      .login({
+        onQr: async (confirmUrl: string) => {
+          state.qrDataUrl = await (qrcode as any).toDataURL(confirmUrl, { width: 260 });
+        },
+      })
+      .then(async (credentials: any) => {
+        m.saveCredentials(credentials, { store });
+        try { ensureWereadAccountFiles(credentials, store); } catch {}
+        state.status = "done";
+        state.vid = String(credentials.vid);
+        return credentials;
+      })
+      .catch((err: any) => {
+        state.status = "error";
+        state.error = err?.message || String(err);
+        throw err;
+      });
+    for (let i = 0; i < 20 && !state.qrDataUrl && state.status === "pending"; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (!state.qrDataUrl) {
+      const err = state.error || "二维码生成失败";
+      state.status = "idle";
+      return c.json({ error: err }, 500);
+    }
+    return c.json({ qr: state.qrDataUrl });
+  } catch (e: any) {
+    state.status = "idle";
+    return c.json({ error: e?.message || "登录启动失败" }, 500);
+  }
+});
+
+app.get("/api/weread/user/login/status", async (c) => {
+  const sessionId = getSessionId(c);
+  if (!sessionId) return c.json({ error: "浏览器会话无效" }, 400);
+  const state = getUserLoginState(sessionId);
+  return c.json({ status: state.status, vid: state.vid, error: state.error });
+});
+
+app.get("/api/weread/user/status", async (c) => {
+  const sessionId = getSessionId(c);
+  if (!sessionId) return c.json({ loggedIn: false });
+  try {
+    const m = await weread();
+    const credentials = m.loadCredentials({ store: `user-${sessionId}` });
+    return c.json({ loggedIn: true, vid: String(credentials.vid) });
+  } catch {
+    return c.json({ loggedIn: false });
+  }
+});
+
+app.post("/api/weread/user/logout", async (c) => {
+  const sessionId = getSessionId(c);
+  if (!sessionId) return c.json({ error: "浏览器会话无效" }, 400);
+  const store = `user-${sessionId}`;
+  const root = NODE_ENV2.WEREAD_CONFIG_DIR || join(homedir(), ".config", "weread");
+  try {
+    rmSync(join(root, "accounts", store), { recursive: true, force: true });
+    rmSync(join(root, `credentials.${store}.json`), { force: true });
+    userLoginStates.delete(sessionId);
+    return c.json({ ok: true });
+  } catch (e: any) {
+    return c.json({ error: e?.message || "退出失败" }, 500);
+  }
+});
+
 app.post("/api/weread/logout", async (c) => {
   if (!checkAdmin2(c)) return c.json({ error: "unauthorized" }, 401);
   try {
@@ -616,6 +744,10 @@ app.post("/api/weread/logout", async (c) => {
 // ─── Batch export via weread-omni ───────────────────────────────────
 
 app.post("/api/batch/start", async (c) => {
+  const sessionId = getSessionId(c);
+  if (!sessionId) {
+    return c.json({ error: "请先扫码登录你自己的微信读书账号", needLogin: true }, 401);
+  }
   const body = await c.req.json().catch(() => ({ url: "" }));
   const url: string = body.url || "";
   const name: string = (body.name || "").trim();
@@ -623,7 +755,12 @@ app.post("/api/batch/start", async (c) => {
     return c.json({ error: "请粘贴该公众号任意一篇文章的微信链接，或输入公众号名称" }, 400);
   }
   try {
-    const weread = await getCanonicalClient();
+    let weread: any;
+    try {
+      weread = await getUserCanonicalClient(sessionId);
+    } catch {
+      return c.json({ error: "你的微信读书登录态不存在或已过期，请重新扫码", needLogin: true }, 401);
+    }
     let accountId = "";
     let displayName = "";
     if (name && (!url || !url.includes("mp.weixin.qq.com"))) {
@@ -698,10 +835,10 @@ app.post("/api/batch/start", async (c) => {
   } catch (e: any) {
     const msg = e?.message || "解析失败";
     if (msg.includes("-2041") || msg.includes("验证")) {
-      return c.json({ error: "数据源暂时受限，请稍后再试或联系站长。" }, 429);
+      return c.json({ error: "你的微信读书账号触发人机验证，请在微信读书 App 完成验证后重试。" }, 429);
     }
     if (msg.includes("credentials") || msg.includes("login") || msg.includes("登录")) {
-      return c.json({ error: "数据源暂时不可用，请稍后再试或联系站长。" }, 401);
+      return c.json({ error: "你的微信读书登录态已过期，请重新扫码。" }, 401);
     }
     return c.json({ error: msg }, 500);
   }
@@ -711,6 +848,10 @@ app.post("/api/batch/start", async (c) => {
 app.post("/api/batch/zip", async (c) => {
   const { articles, name, accountId = "" } = await c.req.json().catch(() => ({ articles: [] as any[], name: "公众号", accountId: "" }));
   if (!Array.isArray(articles) || !articles.length) return c.json({ error: "缺少文章列表" }, 400);
+  const sessionId = getSessionId(c);
+  if (!sessionId) {
+    return c.json({ error: "请先扫码登录你自己的微信读书账号", needLogin: true }, 401);
+  }
   const exportCode = (c.req.header("x-export-code") || "").trim().toUpperCase();
   const isAdminReq = checkAdmin2(c);
   if (!isAdminReq) {
@@ -724,13 +865,17 @@ app.post("/api/batch/zip", async (c) => {
     }
   }
   try {
+    let wereadClient: any = null;
+    try {
+      wereadClient = await getUserCanonicalClient(sessionId);
+    } catch {
+      return c.json({ error: "你的微信读书登录态不存在或已过期，请重新扫码", needLogin: true }, 401);
+    }
     const jszipMod: any = await import("jszip");
     const JSZip = jszipMod.JSZip || jszipMod.default?.JSZip || jszipMod.default;
     const zip = new JSZip();
     const queue = [...articles];
     let done = 0;
-    let wereadClient: any = null;
-    try { wereadClient = await getCanonicalClient(); } catch { /* 未登录时只能用公开链接 */ }
     async function resolveRealUrl(art: any): Promise<string> {
       if (wereadClient && art.reviewId) {
         try {
@@ -868,7 +1013,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .hero h1 { font-size: 40px; line-height: 1.25; font-weight: 800; letter-spacing: .5px; margin-bottom: 14px; }
   .grad-text { background: var(--grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
   .hero .sub { color: var(--text-2); font-size: 16px; }
-  .src-chip { display: inline-flex; align-items: center; gap: 7px; margin-top: 20px; padding: 7px 16px; font-size: 13px; font-weight: 500; border-radius: 999px; background: rgba(255,255,255,.8); border: 1px solid var(--line); cursor: default; color: var(--text-2); transition: border-color .25s var(--ease), box-shadow .25s var(--ease); backdrop-filter: blur(6px); }
+  .src-chip { display: inline-flex; align-items: center; gap: 7px; margin-top: 20px; padding: 7px 16px; font-size: 13px; font-weight: 500; border-radius: 999px; background: rgba(255,255,255,.8); border: 1px solid var(--line); cursor: pointer; color: var(--text-2); transition: border-color .25s var(--ease), box-shadow .25s var(--ease); backdrop-filter: blur(6px); }
   .src-chip:hover { border-color: var(--brand-soft); box-shadow: 0 4px 14px rgba(47,111,202,.12); }
   .src-chip .dot { width: 8px; height: 8px; border-radius: 50%; }
   .src-chip .dot.ok { background: #22b573; box-shadow: 0 0 0 3px rgba(34,181,115,.16); }
@@ -1004,7 +1149,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <div class="eyebrow">WECHAT ARTICLE TOOLKIT</div>
     <h1>公众号文章，<span class="grad-text">一键导出</span></h1>
     <p class="sub">单篇秒下 · 整号批量打包 · Markdown / HTML / 纯文本</p>
-    <button class="src-chip" id="src-chip" title="数据源状态">
+    <button class="src-chip" id="src-chip" onclick="openLoginModal()" title="微信读书登录状态">
       <span class="dot" id="src-dot"></span><span id="src-text">数据源检测中...</span>
     </button>
   </header>
@@ -1049,7 +1194,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         </div>
         <button class="big-btn" id="btn-batch" onclick="batchStart()">🔍 解析并获取全部文章</button>
         <div class="error" id="batch-error"></div>
-        <div class="renew-btn" id="renew-btn">数据源暂时不可用，请稍后再试或联系站长。</div>
+        <button class="renew-btn" id="renew-btn" onclick="openLoginModal()">📱 批量导出前，请先扫码登录你自己的微信读书</button>
         <div class="tips" style="margin-top:16px">
           💡 <strong>怎么导出一个公众号的全部文章？</strong><br>
           1. 直接输入公众号名称（如「遇见一诺」），或粘贴该号任意一篇文章链接<br>
@@ -1133,24 +1278,15 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <button class="modal-close" onclick="closeLoginModal()">×</button>
     <h3>📱 微信读书授权</h3>
     <div id="modal-user-step" style="display:none">
-      <p style="font-size:14px;text-align:center;color:var(--text-2)">当前已登录微信读书账号</p>
+      <p style="font-size:14px;text-align:center;color:var(--text-2)">你已登录自己的微信读书账号</p>
       <p class="ok" style="text-align:center;margin-top:6px">vid <span id="modal-cur-vid"></span></p>
       <div style="display:flex;gap:10px;margin-top:18px">
-        <button class="big-btn" style="flex:1;padding:12px;margin-top:0" onclick="modalRescan()">重新扫码登录</button>
+        <button class="big-btn" style="flex:1;padding:12px;margin-top:0" onclick="modalRescan()">重新扫码</button>
         <button class="big-btn ghost" style="flex:1;padding:12px;margin-top:0;color:#e05252" onclick="modalLogout()">退出登录</button>
       </div>
-      <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line)">
-        <button class="big-btn ghost" style="padding:11px" onclick="adminGenCode()">💰 生成导出账号（¥9.9 已收款后点此）</button>
-        <div id="admin-gen-result" style="margin-top:10px;font-size:14px;text-align:center"></div>
-      </div>
-      <p class="hint" style="margin-top:12px">账号被风控或需换号时，可退出后重新扫码</p>
+      <p class="hint" style="margin-top:12px">登录态与当前浏览器绑定，7 天未使用自动清理。</p>
     </div>
-    <div id="modal-pwd-step">
-      <p style="font-size:13px;color:var(--text-3);margin-bottom:12px;text-align:center">此操作需站长授权密码（访客无需理会）</p>
-      <input type="password" id="modal-code" placeholder="输入授权密码" />
-      <button class="big-btn" style="padding:12px" onclick="modalAuth()">确认</button>
-      <p class="hint" id="modal-err" style="color:#e05252;display:none"></p>
-    </div>
+    <div id="modal-pwd-step" style="display:none"></div>
     <div id="modal-qr-step" style="display:none">
       <div class="qr-box"><img id="modal-qr-img" alt="二维码" /></div>
       <p class="hint">请用 <b>微信</b> 扫码，打开微信读书完成授权<br>扫码成功后本页面自动继续</p>
@@ -1227,7 +1363,7 @@ async function batchStart() {
   document.getElementById('batch-elapsed').textContent = '0';
   elapsedTimer = setInterval(() => { sec++; document.getElementById('batch-elapsed').textContent = String(sec); }, 1000);
   try {
-    const resp = await fetch('/api/batch/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+    const resp = await fetch('/api/batch/start', { method: 'POST', headers: wereadHeaders({ 'content-type': 'application/json' }), body: JSON.stringify(payload) });
     const data = await resp.json();
     if (!resp.ok) {
       const err = new Error(data.error || '解析失败');
@@ -1250,7 +1386,7 @@ async function batchStart() {
     document.getElementById('bs-done').classList.add('show');
   } catch (e) {
     showBatchError(e.message);
-    if (e.status === 401) document.getElementById('renew-btn').classList.add('show');
+    if (e.needLogin) openLoginModal();
     document.getElementById('bs-progress').classList.remove('show');
     document.getElementById('bs-input').classList.add('show');
   }
@@ -1342,7 +1478,7 @@ async function startZipDownload() {
   zipAbort = new AbortController();
   let canceled = false;
   try {
-    const resp = await fetch('/api/batch/zip', { method: 'POST', headers: { 'content-type': 'application/json', 'x-export-code': localStorage.getItem('export_code') || '' }, body: JSON.stringify({ articles: batchArticles, name: batchName, accountId: batchMpId }), signal: zipAbort.signal });
+    const resp = await fetch('/api/batch/zip', { method: 'POST', headers: wereadHeaders({ 'content-type': 'application/json', 'x-export-code': localStorage.getItem('export_code') || '' }), body: JSON.stringify({ articles: batchArticles, name: batchName, accountId: batchMpId }), signal: zipAbort.signal });
     if (resp.status === 402) {
       const d = await resp.json().catch(() => ({}));
       const err = new Error(d.error || '需要导出账号'); err.needCode = true; throw err;
@@ -1357,6 +1493,7 @@ async function startZipDownload() {
   } catch (e) {
     if (e.name === 'AbortError') { canceled = true; }
     else if (e.needCode) { openPayModal(); }
+    else if (e.needLogin) { alert(e.message); openLoginModal(); }
     else { alert('打包失败: ' + e.message); }
   }
   finally {
@@ -1382,109 +1519,111 @@ function batchReset() {
 }
 function showBatchError(msg) { const box = document.getElementById('batch-error'); box.textContent = '⚠ ' + msg; box.classList.add('show'); }
 
-// ============ 数据源状态徽章 + 授权弹窗 ============
+// ============ 用户自己的微信读书登录 ============
 let modalPollTimer = null;
+
+function getWereadSessionId() {
+  let sid = localStorage.getItem('weread_session_id');
+  if (!sid || !/^[A-Za-z0-9_-]{16,64}$/.test(sid)) {
+    const raw = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
+    sid = raw.replace(/[^A-Za-z0-9_-]/g, '');
+    while (sid.length < 16) sid += Math.random().toString(36).slice(2);
+    sid = sid.slice(0, 64);
+    localStorage.setItem('weread_session_id', sid);
+  }
+  return sid;
+}
+
+function wereadHeaders(extra = {}) {
+  return { 'x-weread-session': getWereadSessionId(), ...(extra || {}) };
+}
 
 async function refreshSrcChip() {
   const dot = document.getElementById('src-dot');
   const text = document.getElementById('src-text');
   try {
-    const r = await fetch('/api/weread/public-status');
+    const r = await fetch('/api/weread/user/status', { headers: wereadHeaders() });
     const d = await r.json();
-    if (d.loggedIn) { dot.className = 'dot ok'; text.textContent = '数据源正常'; }
-    else { dot.className = 'dot bad'; text.textContent = '数据源维护中'; }
-  } catch { dot.className = 'dot bad'; text.textContent = '数据源状态未知'; }
+    if (d.loggedIn) {
+      dot.className = 'dot ok';
+      text.textContent = '微信读书已登录';
+    } else {
+      dot.className = 'dot bad';
+      text.textContent = '微信读书未登录，点击扫码';
+    }
+  } catch {
+    dot.className = 'dot bad';
+    text.textContent = '微信读书状态未知';
+  }
 }
 refreshSrcChip();
 
-function openLoginModal() {
+async function openLoginModal() {
   document.getElementById('renew-btn').classList.remove('show');
   document.getElementById('login-modal').classList.add('show');
-  const saved = localStorage.getItem('admin_code');
-  if (!saved) {
-    showModalStep('modal-pwd-step');
-    return;
-  }
-  // 已存密码：先查登录态，已登录 → 账号管理步骤；未登录 → 直接扫码
-  modalApi('/api/weread/status').then(st => {
-    if (st.loggedIn) {
-      document.getElementById('modal-cur-vid').textContent = st.vid || '';
+  try {
+    const r = await fetch('/api/weread/user/status', { headers: wereadHeaders() });
+    const d = await r.json();
+    if (d.loggedIn) {
+      document.getElementById('modal-cur-vid').textContent = d.vid || '';
       showModalStep('modal-user-step');
-    } else {
-      modalAuthWith(saved);
+      return;
     }
-  }).catch(e => {
-    if (e.status === 401) { localStorage.removeItem('admin_code'); showModalStep('modal-pwd-step'); }
-    else showModalStep('modal-pwd-step');
-  });
+  } catch {}
+  await modalStartLogin();
 }
 
 function showModalStep(id) {
-  ['modal-user-step', 'modal-pwd-step', 'modal-qr-step', 'modal-done-step'].forEach(x => {
+  ['modal-user-step', 'modal-qr-step', 'modal-done-step'].forEach(x => {
     document.getElementById(x).style.display = (x === id) ? 'block' : 'none';
   });
 }
 
 async function modalRescan() {
-  const saved = localStorage.getItem('admin_code');
-  if (saved) modalAuthWith(saved);
+  await modalStartLogin();
 }
 
 async function modalLogout() {
-  if (!confirm('确定退出登录？退出后批量导出不可用，需重新扫码。')) return;
+  if (!confirm('确定退出当前微信读书登录？退出后批量导出需重新扫码。')) return;
   try {
-    await modalApi('/api/weread/logout', { method: 'POST' });
+    await fetch('/api/weread/user/logout', { method: 'POST', headers: wereadHeaders() });
     closeLoginModal();
     refreshSrcChip();
-  } catch (e) { alert('退出失败: ' + e.message); }
+  } catch (e) { alert('退出失败，请重试'); }
 }
+
 function closeLoginModal() {
   document.getElementById('login-modal').classList.remove('show');
   if (modalPollTimer) { clearInterval(modalPollTimer); modalPollTimer = null; }
 }
 
-function modalAuth() {
-  const code = document.getElementById('modal-code').value.trim();
-  if (!code) return;
-  modalAuthWith(code);
-}
-
-async function modalApi(path, opts = {}) {
-  const resp = await fetch(path, { ...opts, headers: { 'x-admin-code': localStorage.getItem('admin_code') || '', ...(opts.headers||{}) } });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw Object.assign(new Error(data.error || resp.status), { status: resp.status });
-  return data;
-}
-
-async function modalAuthWith(code) {
-  localStorage.setItem('admin_code', code);
+async function modalStartLogin() {
   const errEl = document.getElementById('modal-err');
   errEl.style.display = 'none';
   try {
-    const data = await modalApi('/api/weread/login/start', { method: 'POST' });
+    const data = await fetch('/api/weread/user/login/start', { method: 'POST', headers: wereadHeaders() }).then(r => r.json());
     if (data.error) throw new Error(data.error);
-    document.getElementById('modal-pwd-step').style.display = 'none';
-    document.getElementById('modal-qr-step').style.display = 'block';
+    showModalStep('modal-qr-step');
     document.getElementById('modal-qr-img').src = data.qr;
     document.getElementById('modal-status').textContent = '等待扫码...';
+    if (modalPollTimer) clearInterval(modalPollTimer);
     modalPollTimer = setInterval(modalCheckLogin, 3000);
   } catch (e) {
-    if (e.status === 401) { errEl.textContent = '密码错误'; errEl.style.display = 'block'; localStorage.removeItem('admin_code'); }
-    else { errEl.textContent = '启动失败: ' + e.message; errEl.style.display = 'block'; }
+    errEl.textContent = '启动失败: ' + e.message;
+    errEl.style.display = 'block';
   }
 }
 
 async function modalCheckLogin() {
   try {
-    const data = await modalApi('/api/weread/login/status');
+    const data = await fetch('/api/weread/user/login/status', { headers: wereadHeaders() }).then(r => r.json());
     if (data.status === 'done') {
       if (modalPollTimer) { clearInterval(modalPollTimer); modalPollTimer = null; }
-      document.getElementById('modal-qr-step').style.display = 'none';
-      document.getElementById('modal-done-step').style.display = 'block';
+      showModalStep('modal-done-step');
       refreshSrcChip();
     } else if (data.status === 'error') {
       if (modalPollTimer) { clearInterval(modalPollTimer); modalPollTimer = null; }
-      document.getElementById('modal-status').innerHTML = '<span style="color:#e05252">登录失败: ' + (data.error||'') + '</span>';
+      document.getElementById('modal-status').innerHTML = '<span style="color:#e05252">登录失败: ' + (data.error || '') + '</span>';
     }
   } catch { /* keep polling */ }
 }
